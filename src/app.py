@@ -1,3 +1,4 @@
+import threading
 import customtkinter as ctk
 from tkinter import filedialog
 import datetime
@@ -6,6 +7,7 @@ import ctypes
 from pathlib import Path
 import sys
 from PIL import Image
+import traceback
 
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
@@ -54,15 +56,102 @@ def log_message(message):
     
     print(f"[Startup Log] {message}")
 
-def set_buttons_state(state):
-    """Locks or unlocks action buttons to prevent double-clicking during processing."""
-    cadence_btn.configure(state=state)
-    database_btn.configure(state=state)
-    upload_btn.configure(state=state)
-    if hasattr(app, 'selected_path') and app.selected_path and state == "normal":
+# --- Loading Animation Controller ---
+animation_job = None
+dot_count = 0
+
+# Rotating spinner frames (creates a clean circular loading effect)
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+def animate_button_text(button, base_text):
+    """Dynamically cycles through circular spinner frames while processing is active."""
+    global animation_job, dot_count
+    if getattr(app, 'is_processing', False):
+        frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
+        button.configure(text=f"{frame}  {base_text}...")
+        dot_count += 1
+        # 100ms interval makes the spinner rotate smoothly and fast
+        animation_job = app.after(100, lambda: animate_button_text(button, base_text))
+
+def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
+    """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
+    if getattr(app, 'is_processing', False):
+        return
+        
+    if not hasattr(app, 'selected_path') or not app.selected_path:
+        log_message("Warning: Please upload a file before running the cleaner.")
+        return
+    
+    file_name = Path(app.selected_path).name
+    log_message(f"Processing file on '{file_name}'... Please wait.")
+    
+    app.is_processing = True
+    
+    # Lock other controls
+    upload_btn.configure(state="disabled")
+    clear_btn.configure(state="disabled")
+    other_btn = database_btn if button == cadence_btn else cadence_btn
+    other_btn.configure(state="disabled", fg_color="#132238", hover_color="#132238")
+    
+    button.configure(fg_color="#1B365D", hover_color="#1B365D")
+    
+    global dot_count
+    dot_count = 0
+    animate_button_text(button, base_text)
+
+    def background_execution():
+        try:
+            row_count, output_path = cleaner_func(app.selected_path)
+            app.after(0, lambda: handle_success(row_count, output_path, button, base_text, default_color, hover_color))
+        except Exception as e:
+            # Capture the complete Python traceback string
+            error_trace = traceback.format_exc()
+            app.after(0, lambda: handle_error(error_trace, button, base_text, default_color, hover_color))
+
+    threading.Thread(target=background_execution, daemon=True).start()
+
+def handle_success(row_count, output_path, button, base_text, default_color, hover_color):
+    global animation_job
+    app.is_processing = False
+    if animation_job:
+        app.after_cancel(animation_job)
+    
+    # Restore button states & original styling
+    button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
+    other_btn = database_btn if button == cadence_btn else cadence_btn
+    other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
+                        hover_color=DB_HOVER if other_btn == database_btn else CADENCE_HOVER,
+                        state="normal")
+    upload_btn.configure(state="normal")
+    if hasattr(app, 'selected_path') and app.selected_path:
         clear_btn.configure(state="normal")
-    else:
-        clear_btn.configure(state=state)
+
+    app.last_output_path = output_path
+    log_message(f"Successfully Cleaned {row_count} rows.")
+    log_message(f"Saved to: {output_path}")
+    
+    open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
+
+def handle_error(error_message, button, base_text, default_color, hover_color):
+    global animation_job
+    app.is_processing = False
+    if animation_job:
+        app.after_cancel(animation_job)
+        
+    # Restore button states & original styling
+    button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
+    other_btn = database_btn if button == cadence_btn else cadence_btn
+    other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
+                        hover_color=DB_HOVER if other_btn == database_btn else CADENCE_HOVER,
+                        state="normal")
+    upload_btn.configure(state="normal")
+    if hasattr(app, 'selected_path') and app.selected_path:
+        clear_btn.configure(state="normal")
+
+    # Log the full traceback line-by-line into the status box
+    log_message("Error during cleaning process:")
+    for line in error_message.strip().split("\n"):
+        log_message(line)
 
 def upload_file():
     filename = filedialog.askopenfilename(
@@ -111,52 +200,12 @@ def open_cleaned_file():
         log_message("No generated file found to open.")
 
 def run_cadence_cleaner():
-    if not hasattr(app, 'selected_path') or not app.selected_path:
-        log_message("Warning: Please upload a file before running Cadence Cleaner.")
-        return
-    
-    file_name = app.selected_path.split('/')[-1]
-    log_message(f"Processing Cadence File on '{file_name}'... Please wait.")
-    set_buttons_state("disabled")
-    app.update()  # Refresh GUI immediately so status and lock show up
-    
-    try:
-        from cadence_cleaner import process_cadence
-        row_count, output_path = process_cadence(app.selected_path)
-        
-        app.last_output_path = output_path
-        log_message(f"Successfully Cleaned {row_count} rows.")
-        log_message(f"Saved to: {output_path}")
-        
-        open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
-    except Exception as e:
-        log_message(f"Error during cleaning: {str(e)}")
-    finally:
-        set_buttons_state("normal")
+    from cadence_cleaner import process_cadence
+    run_cleaner_threaded(process_cadence, cadence_btn, "Cadence Cleaner", CADENCE_COLOR, CADENCE_HOVER)
 
 def run_database_cleaner():
-    if not hasattr(app, 'selected_path') or not app.selected_path:
-        log_message("Warning: Please upload a file before running Database Cleaner.")
-        return
-    
-    file_name = app.selected_path.split('/')[-1]
-    log_message(f"Processing Database File on '{file_name}'... Please wait.")
-    set_buttons_state("disabled")
-    app.update()  # Refresh GUI immediately
-    
-    try:
-        from database_cleaner import process_database
-        row_count, output_path = process_database(app.selected_path)
-        
-        app.last_output_path = output_path
-        log_message(f"Successfully Cleaned {row_count} rows.")
-        log_message(f"Saved to: {output_path}")
-        
-        open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
-    except Exception as e:
-        log_message(f"Error during database cleaning: {str(e)}")
-    finally:
-        set_buttons_state("normal")
+    from database_cleaner import process_database
+    run_cleaner_threaded(process_database, database_btn, "Database Cleaner", DB_COLOR, DB_HOVER)
 
 # Taskbar ID & Window Icon Setup
 try:
@@ -167,7 +216,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v0.0.8")
+app.title("Strat Data Cleaner v0.0.9")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -186,22 +235,21 @@ center_y = int((screen_height - window_height) / 2)
 app.geometry(f"{window_width}x{window_height}+{center_x}+{center_y}")
 app.resizable(False, False)
 
-# --- Theme Palette (Logo-Aligned & Distinct Action Colors) ---
+# --- Theme Palette ---
 NAVY_BLUE = "#06101E"       
 CARD_BG = "#0D1B2A"         
 BORDER_COLOR = "#1B365D"    
 WHITE = "#FFFFFF"
 
-# Refined Distinct Button Colors
-ACCENT_ORANGE = "#0096C7"   # Browse File
-HOVER_ORANGE = "#00B4D8"    # Hover for Browse File
+ACCENT_ORANGE = "#0096C7"   
+HOVER_ORANGE = "#00B4D8"    
 
-CADENCE_COLOR = "#4361EE"   # Cadence Cleaner (Cobalt Blue)
+CADENCE_COLOR = "#4361EE"   
 CADENCE_HOVER = "#5B9AFF"
 
-DB_COLOR = "#0096C7"        # Database Cleaner (Mint Teal)
+DB_COLOR = "#0096C7"        
 DB_HOVER = "#00B4D8"
-DB_TEXT_COLOR = "#FFFFFF"   # Dark high-contrast text for bright mint button
+DB_TEXT_COLOR = "#FFFFFF"   
 
 OPEN_BTN_COLOR = "#2A9D8F"
 OPEN_BTN_HOVER = "#3AAFAF"
@@ -213,18 +261,11 @@ LOG_TEXT = "#64FFDA"
 
 app.configure(fg_color=NAVY_BLUE)
 
-# Load Button Icons via CTkImage Helper
-folder_icon = load_icon("folder.png", size=(16, 16))
-cadence_icon = load_icon("cadence_cleaning.ico", size=(18, 18))
-db_icon = load_icon("database_cleaning.ico", size=(18, 18))
-open_icon = load_icon("open.png", size=(18, 18))
-close_icon = load_icon("close.png", size=(14, 14))
-
 # Main Container
 main_frame = ctk.CTkFrame(app, fg_color=NAVY_BLUE, corner_radius=0)
 main_frame.pack(fill="both", expand=True, padx=25, pady=20)
 
-# 1. Header Title with Logo Brand Layout
+# 1. Header Title
 header_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
 header_frame.pack(fill="x", pady=(0, 15))
 
@@ -259,7 +300,6 @@ upload_btn = ctk.CTkButton(
     corner_radius=8,
     width=120,
     height=36,
-    image=folder_icon,
     compound="left",
     command=upload_file
 )
@@ -275,16 +315,15 @@ file_label = ctk.CTkLabel(
 file_label.grid(row=0, column=1, sticky="w", padx=10)
 
 clear_btn = ctk.CTkButton(
-    upload_card,
-    text="✕" if close_icon is None else "",
+    upload_card, 
+    text="✖", 
     font=("Arial", 12, "bold"),
-    fg_color="#C0392B",
-    hover_color="#E74C3C",
+    fg_color="#C0392B", 
+    hover_color="#E74C3C", 
     text_color=WHITE,
-    corner_radius=6,
-    width=30,
-    height=30,
-    image=close_icon,
+    corner_radius=6, 
+    width=30, 
+    height=30, 
     command=clear_file
 )
 
@@ -323,7 +362,7 @@ database_btn = ctk.CTkButton(
     font=("Arial", 12, "bold"),
     fg_color=DB_COLOR,
     hover_color=DB_HOVER,
-    text_color=DB_TEXT_COLOR,  # High contrast text for mint teal
+    text_color=DB_TEXT_COLOR,
     corner_radius=10,
     height=42,
     compound="left",
@@ -341,7 +380,6 @@ open_output_btn = ctk.CTkButton(
     corner_radius=10,
     height=36,
     state="disabled",
-    image=open_icon,
     compound="left",
     command=open_cleaned_file
 )
@@ -372,7 +410,7 @@ status_box._textbox.tag_config("normal", foreground=LOG_TEXT)
 status_box._textbox.tag_config("success", foreground="#2ECC71")
 status_box._textbox.tag_config("warning", foreground="#F1C40F")
 status_box._textbox.tag_config("error", foreground="#E74C3C")
-status_box._textbox.tag_config("processing", foreground="#3A86FF") # Blue highlight for active work
+status_box._textbox.tag_config("processing", foreground="#3A86FF")
 
 status_box.insert("end", "[System] Application ready. Please upload a file.\n", "normal")
 status_box.configure(state="disabled")
@@ -380,7 +418,7 @@ status_box.configure(state="disabled")
 # 6. Footer Credit
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v0.0.8 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v0.0.9 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
