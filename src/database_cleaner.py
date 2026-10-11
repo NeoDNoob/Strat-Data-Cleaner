@@ -143,7 +143,6 @@ def to_text_id(value: Any) -> Any:
     return str(value).strip()
 
 
-
 # =========================================================
 # ETL FUNCTIONS
 # =========================================================
@@ -244,6 +243,7 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop(index=indices_to_drop).reset_index(drop=True)
     return df
 
+
 # =========================================================
 # MAIN PROCESSOR (Called by GUI)
 # =========================================================
@@ -330,6 +330,28 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         if col in df.columns:
             stripped = df[col].map(lambda v: v.replace(",", "").strip() if isinstance(v, str) else v)
             df[col] = pd.to_numeric(stripped, errors="coerce")
+
+    # --- BRAND CORRECTION RULES ---
+    if "BRAND" in df.columns:
+        df["BRAND"] = df["BRAND"].fillna("").astype(str).str.strip()
+        if "LONG_DESCRIPTION" in df.columns:
+            df["LONG_DESCRIPTION"] = df["LONG_DESCRIPTION"].fillna("").astype(str).str.strip()
+            
+            # 1. Brand "*" with long_description containing "Akaso" -> rename to "Akaso"
+            mask_akaso = (df["BRAND"] == "*") & (df["LONG_DESCRIPTION"].str.contains("Akaso", case=False, na=False))
+            df.loc[mask_akaso, "BRAND"] = "Akaso"
+            
+            # 2. Brand "ZZ" with long_description containing "Earquis" -> rename to "Earquis"
+            mask_earquis = (df["BRAND"] == "ZZ") & (df["LONG_DESCRIPTION"].str.contains("Earquis", case=False, na=False))
+            df.loc[mask_earquis, "BRAND"] = "Earquis"
+            
+            # 3. Brand "*" with long_description containing "Havit" -> rename to "Havit"
+            mask_havit = (df["BRAND"] == "*") & (df["LONG_DESCRIPTION"].str.contains("Havit", case=False, na=False))
+            df.loc[mask_havit, "BRAND"] = "Havit"
+            
+        # 4. Brand named "Plaud" -> change to "PlaudAi"
+        mask_plaud = df["BRAND"].str.upper() == "PLAUD"
+        df.loc[mask_plaud, "BRAND"] = "PlaudAi"
 
     # --- PROPORTIONAL INTEREST ABSORPTION LOGIC ---
     interest_mask = (
