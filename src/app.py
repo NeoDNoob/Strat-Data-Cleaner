@@ -157,20 +157,19 @@ def run_database_cleaner():
         log_message(f"Error during database cleaning: {str(e)}")
     finally:
         set_buttons_state("normal")
-    
-# --- Main Application Setup ---
-app = ctk.CTk()
-app.title("Strat Data Cleaner")
 
 # Taskbar ID & Window Icon Setup
 try:
     myappid = 'StrategyDivision.StratDataCleaner.2026'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception as e:
-    print(f"Warning: Could not set AppUserModelID: {e}")
+    print(f"Warning: Could not set AppUserModelID: {e}") 
 
-BASE_FOLDER = Path(__file__).resolve().parent.parent  
-icon_path = BASE_FOLDER / "assets" / "strat_data_cleaner.ico"
+# --- Main Application Setup ---
+app = ctk.CTk()
+app.title("Strat Data Cleaner")
+
+icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
     app.iconbitmap(str(icon_path))
 except Exception as e:
