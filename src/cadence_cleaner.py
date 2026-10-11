@@ -12,7 +12,6 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 BASE_FOLDER = Path(__file__).resolve().parent.parent
 INPUT_FILE = BASE_FOLDER / "raw" / "raw.xlsx"
 
-# Dynamic Desktop Output Directory (Works on Windows, macOS, and Linux)
 OUTPUT_DIR = Path.home() / "Desktop" / "Cleaned Data"
 
 REQUIRED_COLUMNS = ["STORE_NAME", "BRAND", "EXT_PRICE_W_TAX", "RECEIPT_NO", "CUSTOMER_NAME"]
@@ -91,39 +90,46 @@ def create_category(store: str, brand: str) -> str:
 
     return ""
 
-
 def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes offsetting sale and return pairs on the same receipt for the same customer."""
-    if not {"RECEIPT_NO", "CUSTOMER_NAME", "EXT_PRICE_W_TAX"}.issubset(df.columns):
+    """Removes offsetting sale and return pairs sharing customer_name, receipt_number, or general_notes."""
+    if "EXT_PRICE_W_TAX" not in df.columns:
         return df
 
-    indices_to_drop = []
-    group_cols = ["RECEIPT_NO", "CUSTOMER_NAME"]
-    
-    for _, group in df.groupby(group_cols, dropna=False):
-        if len(group) < 2:
-            continue
-        
-        prices = group["EXT_PRICE_W_TAX"].values
-        index_labels = group.index.values
-        dropped_in_group = set()
-        
-        for i in range(len(prices)):
-            if i in dropped_in_group:
+    cols_to_check = [c for c in ["RECEIPT_NO", "CUSTOMER_NAME", "GENERAL_NOTES"] if c in df.columns]
+    if not cols_to_check:
+        return df
+
+    indices_to_drop = set()
+
+    for col in cols_to_check:
+        for _, group in df.groupby(col, dropna=False):
+            if len(group) < 2:
                 continue
-            for j in range(i + 1, len(prices)):
-                if j in dropped_in_group:
+            key_val = group[col].iloc[0]
+            if pd.isna(key_val) or str(key_val).strip() == "":
+                continue
+
+            prices = group["EXT_PRICE_W_TAX"].values
+            index_labels = group.index.values
+            dropped_in_subgroup = set()
+
+            for i in range(len(prices)):
+                if index_labels[i] in indices_to_drop or i in dropped_in_subgroup:
                     continue
-                # Check if values are exact opposites (e.g., 499.00 and -499.00)
-                if np.isclose(prices[i], -prices[j], atol=1e-5) and prices[i] != 0:
-                    dropped_in_group.add(i)
-                    dropped_in_group.add(j)
-                    indices_to_drop.extend([index_labels[i], index_labels[j]])
-                    break
-                    
+                for j in range(i + 1, len(prices)):
+                    if index_labels[j] in indices_to_drop or j in dropped_in_subgroup:
+                        continue
+                    if np.isclose(prices[i], -prices[j], atol=1e-5) and prices[i] != 0:
+                        dropped_in_subgroup.add(i)
+                        dropped_in_subgroup.add(j)
+                        indices_to_drop.add(index_labels[i])
+                        indices_to_drop.add(index_labels[j])
+                        break
+
     if indices_to_drop:
-        df = df.drop(index=indices_to_drop).reset_index(drop=True)
+        df = df.drop(index=list(indices_to_drop)).reset_index(drop=True)
     return df
+
 
 # =========================================================
 # MAIN PROCESSING FUNCTION (Called by GUI)
@@ -132,7 +138,6 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
 def process_cadence(input_file_path):
     input_path = Path(input_file_path)
 
-    # 1. Read file and skip top title/merged header row (header=1)
     if input_path.suffix.lower() in [".xls", ".xlsx"]:
         df = pd.read_excel(input_path, header=1)
     else:
@@ -140,62 +145,46 @@ def process_cadence(input_file_path):
 
     df.columns = df.columns.astype(str).str.strip().str.upper()
 
-    # Drop ghost columns from merged cells
     df = df.loc[:, ~df.columns.str.contains('UNNAMED', case=False)]
 
-    # Check required columns
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required column(s): {missing}")
 
-    # Ensure numeric price before manipulations
     df["EXT_PRICE_W_TAX"] = pd.to_numeric(df["EXT_PRICE_W_TAX"], errors="coerce").fillna(0)
 
-    # =========================================================
-    # INTEREST / FINANCING ABSORPTION LOGIC
-    # =========================================================
-    # Identify interest rows where brand or description indicates interest charges
     interest_mask = (
         df["BRAND"].isin(["INTEREST"]) | 
         df["LONG_DESCRIPTION"].str.contains("INTEREST", case=False, na=False)
     )
 
     if interest_mask.any():
-        # Isolate interest records and sum them per RECEIPT_NO and CUSTOMER_NAME
         interest_df = df[interest_mask].copy()
         interest_grouped = interest_df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"], as_index=False)["EXT_PRICE_W_TAX"].sum()
         interest_grouped = interest_grouped.rename(columns={"EXT_PRICE_W_TAX": "TOTAL_INTEREST"})
 
-        # Keep only non-interest rows as our main dataset
         df = df[~interest_mask].copy()
 
-        # Merge interest back to the matching receipt/customer records
         df = df.merge(interest_grouped, on=["RECEIPT_NO", "CUSTOMER_NAME"], how="left")
         df["TOTAL_INTEREST"] = df["TOTAL_INTEREST"].fillna(0)
 
-        # Distribute interest proportionally across items in the same receipt (safeguards multi-item receipts)
         receipt_totals = df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"])["EXT_PRICE_W_TAX"].transform("sum")
         proportion = df["EXT_PRICE_W_TAX"] / receipt_totals.replace(0, 1)
 
         df["EXT_PRICE_W_TAX"] = df["EXT_PRICE_W_TAX"] + (df["TOTAL_INTEREST"] * proportion)
         df = df.drop(columns=["TOTAL_INTEREST"])
 
-    # Drop unwanted columns after processing
     to_drop = [c for c in COLUMNS_TO_DROP if c in df.columns]
     df = df.drop(columns=to_drop)
 
-    # Filter zero prices
     zero_mask = df["EXT_PRICE_W_TAX"] == 0
     df = df[~zero_mask].copy()
 
-    # Remove offsetting sale-return pairs
-    remove_sale_return_pairs(df)
+    df = remove_sale_return_pairs(df)
 
-    # Clean text fields
     df["STORE_NAME"] = clean_text(df["STORE_NAME"]).replace(STORE_TYPO_FIXES)
     df["BRAND"] = clean_text(df["BRAND"])
 
-    # Channel & Category Assignment
     df["CHANNEL"] = df["STORE_NAME"].apply(create_channel)
     df["CATEGORY"] = [
         create_category(store, brand)
@@ -205,21 +194,18 @@ def process_cadence(input_file_path):
     tail = ["CATEGORY", "CHANNEL"]
     df = df[[c for c in df.columns if c not in tail] + tail]
 
-    # 2. Setup Destination Path with Dynamic Date Filename
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     current_date = datetime.date.today().strftime("%Y-%m-%d")
     output_file = OUTPUT_DIR / f"cleaned_cadence_{current_date}.xlsx"
 
-    # 3. Save to Excel normally first
     df.to_excel(output_file, index=False, engine='openpyxl')
 
-    # 4. Convert Range into an Official Excel Table
     wb = openpyxl.load_workbook(output_file)
     ws = wb.active
     
     max_row = ws.max_row
-    max_col = ws.max_column
-    col_letter = openpyxl.utils.get_column_letter(max_col)
+    max_column = ws.max_column
+    col_letter = openpyxl.utils.get_column_letter(max_column)
     table_range = f"A1:{col_letter}{max_row}"
 
     tab = Table(displayName="CadenceCleanTable", ref=table_range)
@@ -235,6 +221,4 @@ def process_cadence(input_file_path):
     
     wb.save(output_file)
 
-    
     return len(df), str(output_file)
-
