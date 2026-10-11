@@ -167,7 +167,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner")
+app.title("Strat Data Cleaner v0.0.8")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -380,7 +380,7 @@ status_box.configure(state="disabled")
 # 6. Footer Credit
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v0.0.8 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )

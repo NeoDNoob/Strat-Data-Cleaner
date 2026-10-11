@@ -15,7 +15,6 @@ from openpyxl.utils import get_column_letter
 # CONFIG & MAPPINGS
 # =========================================================
 
-# Dynamic Desktop Output Directory (Works on Windows, macOS, and Linux)
 OUTPUT_DIR = Path.home() / "Desktop" / "Cleaned Data"
 
 HEADER_SCAN_ROWS = 30
@@ -243,6 +242,57 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
         df = df.drop(index=indices_to_drop).reset_index(drop=True)
     return df
 
+def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
+    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'[cite: 8]."""
+    if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
+        return df
+
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+    long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
+
+    # 1. If brand is "*" and long_description contains "Akaso", rename brand to "Akaso"[cite: 8]
+    mask_akaso = (brand == "*") & long_desc.str.contains("Akaso", case=False, na=False)
+    df.loc[mask_akaso, "BRAND"] = "Akaso"
+    
+    # Refresh brand series
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+
+    # 2. If brand is "Plaud", change it to "PlaudAi"[cite: 8]
+    mask_plaud = brand.str.upper() == "PLAUD"
+    df.loc[mask_plaud, "BRAND"] = "PlaudAi"
+    
+    # Refresh brand series
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+
+    # 3 & 4. Handling brand "ZZ"[cite: 8]
+    mask_zz = brand == "ZZ"
+    if mask_zz.any():
+        has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
+        
+        # If "ZZ", contains "Paper Bag", and EXT_PRICE_W_TAX is zero, remove entry[cite: 8]
+        if "EXT_PRICE_W_TAX" in df.columns:
+            zero_price = df["EXT_PRICE_W_TAX"].fillna(0) == 0
+            mask_remove = mask_zz & has_paper_bag & zero_price
+            df = df[~mask_remove].reset_index(drop=True)
+            
+            # Refresh data references after removal
+            brand = df["BRAND"].fillna("").astype(str).str.strip()
+            long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
+            mask_zz = brand == "ZZ"
+            has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
+
+        # If "ZZ" and does NOT contain "Paper Bag", rename brand to first word (proper capitalized format)[cite: 8]
+        mask_rename = mask_zz & ~has_paper_bag
+        if mask_rename.any():
+            def get_first_word(desc: str) -> str:
+                words = desc.strip().split()
+                if words:
+                    return words[0].capitalize()
+                return "ZZ"
+            df.loc[mask_rename, "BRAND"] = long_desc[mask_rename].apply(get_first_word)
+
+    return df
+
 
 # =========================================================
 # MAIN PROCESSOR (Called by GUI)
@@ -307,7 +357,6 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     month_no = dates.dt.month.astype("Int64")
     month_name = month_no.map(lambda m: MONTH_ABBR[int(m) - 1] if pd.notna(m) else None)
     
-    # Format week number as "W" + week (e.g., W40) with safe handling for nulls
     iso_weeks = dates.dt.isocalendar().week
     week_no = pd.Series(
         [f"W{int(w)}" if pd.notna(w) else None for w in iso_weeks], index=df.index
@@ -331,27 +380,8 @@ def process_database(input_file_path: str) -> tuple[int, str]:
             stripped = df[col].map(lambda v: v.replace(",", "").strip() if isinstance(v, str) else v)
             df[col] = pd.to_numeric(stripped, errors="coerce")
 
-    # --- BRAND CORRECTION RULES ---
-    if "BRAND" in df.columns:
-        df["BRAND"] = df["BRAND"].fillna("").astype(str).str.strip()
-        if "LONG_DESCRIPTION" in df.columns:
-            df["LONG_DESCRIPTION"] = df["LONG_DESCRIPTION"].fillna("").astype(str).str.strip()
-            
-            # 1. Brand "*" with long_description containing "Akaso" -> rename to "Akaso"
-            mask_akaso = (df["BRAND"] == "*") & (df["LONG_DESCRIPTION"].str.contains("Akaso", case=False, na=False))
-            df.loc[mask_akaso, "BRAND"] = "Akaso"
-            
-            # 2. Brand "ZZ" with long_description containing "Earquis" -> rename to "Earquis"
-            mask_earquis = (df["BRAND"] == "ZZ") & (df["LONG_DESCRIPTION"].str.contains("Earquis", case=False, na=False))
-            df.loc[mask_earquis, "BRAND"] = "Earquis"
-            
-            # 3. Brand "*" with long_description containing "Havit" -> rename to "Havit"
-            mask_havit = (df["BRAND"] == "*") & (df["LONG_DESCRIPTION"].str.contains("Havit", case=False, na=False))
-            df.loc[mask_havit, "BRAND"] = "Havit"
-            
-        # 4. Brand named "Plaud" -> change to "PlaudAi"
-        mask_plaud = df["BRAND"].str.upper() == "PLAUD"
-        df.loc[mask_plaud, "BRAND"] = "PlaudAi"
+    # --- SPECIAL BRAND CLEANING RULES ---
+    df = clean_special_brands(df)
 
     # --- PROPORTIONAL INTEREST ABSORPTION LOGIC ---
     interest_mask = (
