@@ -8,7 +8,13 @@ from pathlib import Path
 import sys
 from PIL import Image
 import traceback
-from tkinterdnd2 import TkinterDnD, DND_FILES
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
 
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
