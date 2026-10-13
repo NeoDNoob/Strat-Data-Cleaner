@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from PIL import Image
 import traceback
+from tkinterdnd2 import TkinterDnD, DND_FILES
 
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
@@ -35,7 +36,7 @@ def log_message(message):
     try:
         if 'status_box' in globals() and status_box is not None:
             status_box.configure(state="normal")
-            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+            timestamp = datetime.datetime.now().strftime("%I:%M:%S %p")
             
             tag = "normal"
             if any(w in message for w in ["Error", "Missing", "KeyError"]):
@@ -60,7 +61,6 @@ def log_message(message):
 animation_job = None
 dot_count = 0
 
-# Rotating spinner frames (creates a clean circular loading effect)
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 def animate_button_text(button, base_text):
@@ -70,7 +70,6 @@ def animate_button_text(button, base_text):
         frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
         button.configure(text=f"{frame}  {base_text}...")
         dot_count += 1
-        # 100ms interval makes the spinner rotate smoothly and fast
         animation_job = app.after(100, lambda: animate_button_text(button, base_text))
 
 def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
@@ -87,7 +86,6 @@ def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_c
     
     app.is_processing = True
     
-    # Lock other controls
     upload_btn.configure(state="disabled")
     clear_btn.configure(state="disabled")
     other_btn = database_btn if button == cadence_btn else cadence_btn
@@ -104,7 +102,6 @@ def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_c
             row_count, output_path = cleaner_func(app.selected_path)
             app.after(0, lambda: handle_success(row_count, output_path, button, base_text, default_color, hover_color))
         except Exception as e:
-            # Capture the complete Python traceback string
             error_trace = traceback.format_exc()
             app.after(0, lambda: handle_error(error_trace, button, base_text, default_color, hover_color))
 
@@ -116,7 +113,6 @@ def handle_success(row_count, output_path, button, base_text, default_color, hov
     if animation_job:
         app.after_cancel(animation_job)
     
-    # Restore button states & original styling
     button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
     other_btn = database_btn if button == cadence_btn else cadence_btn
     other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
@@ -138,7 +134,6 @@ def handle_error(error_message, button, base_text, default_color, hover_color):
     if animation_job:
         app.after_cancel(animation_job)
         
-    # Restore button states & original styling
     button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
     other_btn = database_btn if button == cadence_btn else cadence_btn
     other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
@@ -148,10 +143,18 @@ def handle_error(error_message, button, base_text, default_color, hover_color):
     if hasattr(app, 'selected_path') and app.selected_path:
         clear_btn.configure(state="normal")
 
-    # Log the full traceback line-by-line into the status box
     log_message("Error during cleaning process:")
     for line in error_message.strip().split("\n"):
         log_message(line)
+
+def process_selected_file(filename):
+    if filename:
+        short_name = Path(filename).name
+        file_label.configure(text=f"Selected: {short_name}", text_color="#64FFDA")
+        upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+        app.selected_path = filename
+        clear_btn.grid(row=0, column=2, padx=(5, 15))  
+        log_message(f"File loaded successfully: {short_name}")
 
 def upload_file():
     filename = filedialog.askopenfilename(
@@ -159,19 +162,35 @@ def upload_file():
         filetypes=(("Excel Files", "*.xlsx *.xls"), ("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*"))
     )
     if filename:
-        short_name = filename.split('/')[-1]
-        file_label.configure(text=f"Selected: {short_name}", text_color="#64FFDA")
-        app.selected_path = filename
-        clear_btn.grid(row=0, column=2, padx=(5, 15))  
-        log_message(f"File loaded successfully: {short_name}")
+        process_selected_file(filename)
     else:
         log_message("File selection cancelled.")
 
+# --- Drag & Drop Visual Animation Handlers ---
+def on_file_enter(event):
+    """Triggers visual highlight animation when a file is dragged over the upload card."""
+    if not getattr(app, 'is_processing', False):
+        upload_card.configure(border_color="#64FFDA", border_width=2)
+        file_label.configure(text="Drop file to load...", text_color="#64FFDA")
+
+def on_file_leave(event):
+    """Reverts visual highlight when the dragged file leaves the upload card area."""
+    if not getattr(app, 'is_processing', False) and (not hasattr(app, 'selected_path') or not app.selected_path):
+        upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+        file_label.configure(text="No file chosen or Drag & Drop here", text_color=MUTED_TEXT)
+
+def handle_drop(event):
+    """Handles files dropped via drag-and-drop into the upload card."""
+    files = app.tk.splitlist(event.data)
+    if files:
+        filename = files[0].strip('{}')
+        process_selected_file(filename)
+
 def clear_file():
-    """Resets the file selection state and disables output references."""
     app.selected_path = None
     app.last_output_path = None  
-    file_label.configure(text="No file chosen (XLSX, CSV, TXT)", text_color=MUTED_TEXT)
+    file_label.configure(text="No file chosen or Drag & Drop here", text_color=MUTED_TEXT)
+    upload_card.configure(border_color=BORDER_COLOR, border_width=1)
     clear_btn.grid_forget()  
     
     open_output_btn.configure(
@@ -182,7 +201,6 @@ def clear_file():
     log_message("Selected file and output reference cleared.")
 
 def open_cleaned_file():
-    """Opens the most recently generated cleaned Excel file across operating systems."""
     if hasattr(app, 'last_output_path') and app.last_output_path and os.path.exists(app.last_output_path):
         try:
             if sys.platform == "win32":
@@ -198,6 +216,21 @@ def open_cleaned_file():
             log_message(f"Error opening file: {str(e)}")
     else:
         log_message("No generated file found to open.")
+
+def open_destination_folder():
+    """Opens the destination folder directory in file explorer across operating systems."""
+    output_dir = Path.home() / "Desktop" / "Cleaned Data"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(output_dir)
+        elif sys.platform == "darwin":
+            os.system(f"open '{output_dir}'")
+        else:
+            os.system(f"xdg-open '{output_dir}'")
+        log_message("Opened destination folder: Cleaned Data")
+    except Exception as e:
+        log_message(f"Error opening folder: {str(e)}")
 
 def run_cadence_cleaner():
     from cadence_cleaner import process_cadence
@@ -218,15 +251,16 @@ except Exception as e:
 app = ctk.CTk()
 app.title("Strat Data Cleaner v0.0.9")
 
+TkinterDnD.require(app)
+
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
     app.iconbitmap(str(icon_path))
 except Exception as e:
     print(f"Warning: Could not load window icon: {e}")
 
-# Window Dimensions & Centering Logic
 window_width = 620
-window_height = 540
+window_height = 585  # Adjusted slightly to accommodate the new button comfortably
 screen_width = app.winfo_screenwidth()
 screen_height = app.winfo_screenheight()
 center_x = int((screen_width - window_width) / 2)
@@ -285,10 +319,16 @@ subtitle_label = ctk.CTkLabel(
 )
 subtitle_label.pack(side="right", anchor="s")
 
-# 2. Upload Section
+# 2. Upload Section (Drag & Drop with Animation Highlight)
 upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
 upload_card.pack(fill="x", pady=(0, 15))
 upload_card.grid_columnconfigure(1, weight=1)
+
+# Register drop targets and hover animation events
+upload_card.drop_target_register(DND_FILES)
+upload_card.dnd_bind('<<DropEnter>>', on_file_enter)
+upload_card.dnd_bind('<<DropLeave>>', on_file_leave)
+upload_card.dnd_bind('<<Drop>>', handle_drop)
 
 upload_btn = ctk.CTkButton(
     upload_card,
@@ -300,19 +340,23 @@ upload_btn = ctk.CTkButton(
     corner_radius=8,
     width=120,
     height=36,
-    compound="left",
     command=upload_file
 )
 upload_btn.grid(row=0, column=0, padx=15, pady=15)
 
 file_label = ctk.CTkLabel(
     upload_card,
-    text="No file chosen (XLSX, CSV, TXT)",
+    text="No file chosen or Drag & Drop here",
     font=("Arial", 11),
     text_color=MUTED_TEXT,
     anchor="w"
 )
 file_label.grid(row=0, column=1, sticky="w", padx=10)
+
+file_label.drop_target_register(DND_FILES)
+file_label.dnd_bind('<<DropEnter>>', on_file_enter)
+file_label.dnd_bind('<<DropLeave>>', on_file_leave)
+file_label.dnd_bind('<<Drop>>', handle_drop)
 
 clear_btn = ctk.CTkButton(
     upload_card, 
@@ -351,7 +395,6 @@ cadence_btn = ctk.CTkButton(
     text_color=WHITE,
     corner_radius=10,
     height=42,
-    compound="left",
     command=run_cadence_cleaner
 )
 cadence_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
@@ -365,11 +408,11 @@ database_btn = ctk.CTkButton(
     text_color=DB_TEXT_COLOR,
     corner_radius=10,
     height=42,
-    compound="left",
     command=run_database_cleaner
 )
 database_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
+# 5. Output Actions (Open Cleaned File & Open Destination Folder stacked vertically)[cite: 9]
 open_output_btn = ctk.CTkButton(
     main_frame,
     text="Open Cleaned File",
@@ -380,12 +423,24 @@ open_output_btn = ctk.CTkButton(
     corner_radius=10,
     height=36,
     state="disabled",
-    compound="left",
     command=open_cleaned_file
 )
 open_output_btn.pack(fill="x", pady=(0, 5))
 
-# 5. Inline Status Log Box
+open_folder_btn = ctk.CTkButton(
+    main_frame,
+    text="Open Destination Folder",
+    font=("Arial", 12, "bold"),
+    fg_color=OPEN_BTN_COLOR,
+    hover_color=OPEN_BTN_HOVER,
+    text_color=WHITE,
+    corner_radius=10,
+    height=36,
+    command=open_destination_folder
+)
+open_folder_btn.pack(fill="x", pady=(0, 5))
+
+# 6. Inline Status Log Box
 status_label = ctk.CTkLabel(
     main_frame,
     text="Activity Log",
@@ -412,13 +467,13 @@ status_box._textbox.tag_config("warning", foreground="#F1C40F")
 status_box._textbox.tag_config("error", foreground="#E74C3C")
 status_box._textbox.tag_config("processing", foreground="#3A86FF")
 
-status_box.insert("end", "[System] Application ready. Please upload a file.\n", "normal")
+status_box.insert("end", "[System] Application ready. Browse files or drag & drop them onto the card.\n", "normal")
 status_box.configure(state="disabled")
 
-# 6. Footer Credit
+# 7. Footer Credit
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v0.0.9 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v1.0.10 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
