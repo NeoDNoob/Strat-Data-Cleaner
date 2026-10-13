@@ -8,7 +8,14 @@ from pathlib import Path
 import sys
 from PIL import Image
 import traceback
-from tkinterdnd2 import TkinterDnD, DND_FILES
+
+# --- Safe Drag-and-Drop Import Fallback ---
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    HAS_DND = True
+except ImportError:
+    HAS_DND = False
+
 
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
@@ -168,19 +175,16 @@ def upload_file():
 
 # --- Drag & Drop Visual Animation Handlers ---
 def on_file_enter(event):
-    """Triggers visual highlight animation when a file is dragged over the upload card."""
     if not getattr(app, 'is_processing', False):
         upload_card.configure(border_color="#64FFDA", border_width=2)
         file_label.configure(text="Drop file to load...", text_color="#64FFDA")
 
 def on_file_leave(event):
-    """Reverts visual highlight when the dragged file leaves the upload card area."""
     if not getattr(app, 'is_processing', False) and (not hasattr(app, 'selected_path') or not app.selected_path):
         upload_card.configure(border_color=BORDER_COLOR, border_width=1)
         file_label.configure(text="No file chosen or Drag & Drop here", text_color=MUTED_TEXT)
 
 def handle_drop(event):
-    """Handles files dropped via drag-and-drop into the upload card."""
     files = app.tk.splitlist(event.data)
     if files:
         filename = files[0].strip('{}')
@@ -245,13 +249,17 @@ try:
     myappid = 'StrategyDivision.StratDataCleaner.2026'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception as e:
-    print(f"Warning: Could not set AppUserModelID: {e}") 
+    print(f"Warning: Could not set AppUserModelID: {e})") 
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v0.0.9")
+app.title("Strat Data Cleaner v1.0.11")
 
-TkinterDnD.require(app)
+if HAS_DND:
+    try:
+        TkinterDnD.require(app)
+    except Exception:
+        HAS_DND = False
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -260,7 +268,7 @@ except Exception as e:
     print(f"Warning: Could not load window icon: {e}")
 
 window_width = 620
-window_height = 585  # Adjusted slightly to accommodate the new button comfortably
+window_height = 585
 screen_width = app.winfo_screenwidth()
 screen_height = app.winfo_screenheight()
 center_x = int((screen_width - window_width) / 2)
@@ -319,16 +327,16 @@ subtitle_label = ctk.CTkLabel(
 )
 subtitle_label.pack(side="right", anchor="s")
 
-# 2. Upload Section (Drag & Drop with Animation Highlight)
+# 2. Upload Section
 upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
 upload_card.pack(fill="x", pady=(0, 15))
 upload_card.grid_columnconfigure(1, weight=1)
 
-# Register drop targets and hover animation events
-upload_card.drop_target_register(DND_FILES)
-upload_card.dnd_bind('<<DropEnter>>', on_file_enter)
-upload_card.dnd_bind('<<DropLeave>>', on_file_leave)
-upload_card.dnd_bind('<<Drop>>', handle_drop)
+if HAS_DND:
+    upload_card.drop_target_register(DND_FILES)
+    upload_card.dnd_bind('<<DropEnter>>', on_file_enter)
+    upload_card.dnd_bind('<<DropLeave>>', on_file_leave)
+    upload_card.dnd_bind('<<Drop>>', handle_drop)
 
 upload_btn = ctk.CTkButton(
     upload_card,
@@ -344,19 +352,21 @@ upload_btn = ctk.CTkButton(
 )
 upload_btn.grid(row=0, column=0, padx=15, pady=15)
 
+file_label_text = "No file chosen or Drag & Drop here" if HAS_DND else "No file chosen (Click Browse File)"
 file_label = ctk.CTkLabel(
     upload_card,
-    text="No file chosen or Drag & Drop here",
+    text=file_label_text,
     font=("Arial", 11),
     text_color=MUTED_TEXT,
     anchor="w"
 )
 file_label.grid(row=0, column=1, sticky="w", padx=10)
 
-file_label.drop_target_register(DND_FILES)
-file_label.dnd_bind('<<DropEnter>>', on_file_enter)
-file_label.dnd_bind('<<DropLeave>>', on_file_leave)
-file_label.dnd_bind('<<Drop>>', handle_drop)
+if HAS_DND:
+    file_label.drop_target_register(DND_FILES)
+    file_label.dnd_bind('<<DropEnter>>', on_file_enter)
+    file_label.dnd_bind('<<DropLeave>>', on_file_leave)
+    file_label.dnd_bind('<<Drop>>', handle_drop)
 
 clear_btn = ctk.CTkButton(
     upload_card, 
@@ -412,7 +422,7 @@ database_btn = ctk.CTkButton(
 )
 database_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
 
-# 5. Output Actions (Open Cleaned File & Open Destination Folder stacked vertically)[cite: 9]
+# 5. Output Actions
 open_output_btn = ctk.CTkButton(
     main_frame,
     text="Open Cleaned File",
@@ -467,13 +477,13 @@ status_box._textbox.tag_config("warning", foreground="#F1C40F")
 status_box._textbox.tag_config("error", foreground="#E74C3C")
 status_box._textbox.tag_config("processing", foreground="#3A86FF")
 
-status_box.insert("end", "[System] Application ready. Browse files or drag & drop them onto the card.\n", "normal")
+status_box.insert("end", "[System] Application ready. Upload the file to begin.\n", "normal")
 status_box.configure(state="disabled")
 
 # 7. Footer Credit
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v1.0.10 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v1.0.11 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
