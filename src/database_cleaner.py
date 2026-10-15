@@ -141,6 +141,15 @@ def to_text_id(value: Any) -> Any:
         return str(int(value)) if float(value).is_integer() else str(value)
     return str(value).strip()
 
+def clean_associate(value: Any) -> Optional[str]:
+    """Trims whitespace and capitalizes each word properly for associate names."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return " ".join(word.capitalize() for word in text.split())
+
 
 # =========================================================
 # ETL FUNCTIONS
@@ -211,7 +220,7 @@ def parse_date_value(value: Any) -> Optional[pd.Timestamp]:
     return None
 
 def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes offsetting sale and return pairs sharing customer_name, receipt_number, or general_notes."""
+    """Removes offsetting sale and return pairs sharing customer_name, receipt_number, or general_notes[cite: 11]."""
     if "EXT_PRICE_W_TAX" not in df.columns:
         return df
 
@@ -251,7 +260,7 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
-    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'[cite: 8]."""
+    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'[cite: 8, 11]."""
     if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
         return df
 
@@ -366,6 +375,9 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     for col in TEXT_ID_COLUMNS:
         if col in df.columns:
             df[col] = df[col].map(to_text_id)
+
+    if "ASSOCIATE" in df.columns:
+        df["ASSOCIATE"] = df["ASSOCIATE"].map(clean_associate)
 
     for col in NUMERIC_COLUMNS:
         if col in df.columns:
