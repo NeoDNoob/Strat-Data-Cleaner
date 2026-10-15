@@ -36,7 +36,7 @@ STORE_TYPO_FIXES = {
 
 DIRECT_STORES = ["ECOFLOW", "OURA", "RAPTOR", "INSTA360"]
 
-BRAND_RULES = {
+BRAND_RULES = { 
     "ZENITH": [
         "OURA", "PLAUDAI", "BOOX", "COROS", "GARMIN",
         "LOOP", "SHOKZ", "RAYNEO", "RINGCONN", "POLAR",
@@ -46,11 +46,11 @@ BRAND_RULES = {
     ],
     "ALTITUDE": [
         "ECOFLOW", "INSTA360", "DJI", "RAPTOR", "YABER", "ENABOT",
-        "RINGCONN", "OURA", "PLAUDAI", "BOOX", "SHOKZ", "COROS",
+        "RINGCONN", "OURA", "PLAUDAI", "BOOX", "SHOKZ", "COROS","RAYNEO",
     ],
     "UG": [
-        "ECOFLOW", "INSTA360", "DJI", "ANKER", "YABER",
-        "RINGCONN", "OURA", "PLAUDAI", "SHOKZ",
+        "ECOFLOW", "INSTA360", "DJI", "YABER",
+        "RINGCONN", "OURA", "PLAUDAI", "SHOKZ","RAPTOR", "BOOX","COROS", "EMABOT", "RAYNEO",
     ],
 }
 

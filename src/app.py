@@ -85,7 +85,7 @@ def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_c
         return
         
     if not hasattr(app, 'selected_path') or not app.selected_path:
-        log_message("Warning: Please upload a file before running the cleaner.")
+        log_message("Warning: Please upload a retail file before running the cleaner.")
         return
     
     file_name = Path(app.selected_path).name
@@ -154,6 +154,7 @@ def handle_error(error_message, button, base_text, default_color, hover_color):
     for line in error_message.strip().split("\n"):
         log_message(line)
 
+# --- Retail File Handlers ---
 def process_selected_file(filename):
     if filename:
         short_name = Path(filename).name
@@ -161,23 +162,22 @@ def process_selected_file(filename):
         upload_card.configure(border_color=BORDER_COLOR, border_width=1)
         app.selected_path = filename
         clear_btn.grid(row=0, column=2, padx=(5, 15))  
-        log_message(f"File loaded successfully: {short_name}")
+        log_message(f"Retail file loaded: {short_name}")
 
 def upload_file():
     filename = filedialog.askopenfilename(
-        title="Select a File",
+        title="Select Retail File",
         filetypes=(("Excel Files", "*.xlsx *.xls"), ("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*"))
     )
     if filename:
         process_selected_file(filename)
     else:
-        log_message("File selection cancelled.")
+        log_message("Retail file selection cancelled.")
 
-# --- Drag & Drop Visual Animation Handlers ---
 def on_file_enter(event):
     if not getattr(app, 'is_processing', False):
         upload_card.configure(border_color="#64FFDA", border_width=2)
-        file_label.configure(text="Drop file to load...", text_color="#64FFDA")
+        file_label.configure(text="Drop retail file here...", text_color="#64FFDA")
 
 def on_file_leave(event):
     if not getattr(app, 'is_processing', False) and (not hasattr(app, 'selected_path') or not app.selected_path):
@@ -202,8 +202,59 @@ def clear_file():
         fg_color=OPEN_BTN_DISABLED,
         hover_color=OPEN_BTN_DISABLED
     )
-    log_message("Selected file and output reference cleared.")
+    log_message("Retail file selection cleared.")
 
+# --- Meta Data File Handlers (Multi-file Support) ---
+def process_selected_meta_files(filenames):
+    if filenames:
+        count = len(filenames)
+        short_names = ", ".join([Path(f).name for f in filenames[:2]])
+        if count > 2:
+            display_text = f"Selected {count} files ({short_names}, ...)"
+        else:
+            display_text = f"Selected: {short_names}"
+        meta_file_label.configure(text=display_text, text_color="#64FFDA")
+        meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+        app.meta_selected_paths = filenames
+        meta_clear_btn.grid(row=0, column=2, padx=(5, 15))
+        log_message(f"Meta data loaded: {count} file(s) selected.")
+
+def upload_meta_files():
+    filenames = filedialog.askopenfilenames(
+        title="Select Meta Data Files",
+        filetypes=(("Excel Files", "*.xlsx *.xls"), ("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*"))
+    )
+    if filenames:
+        process_selected_meta_files(filenames)
+    else:
+        log_message("Meta data file selection cancelled.")
+
+def on_meta_enter(event):
+    meta_upload_card.configure(border_color="#64FFDA", border_width=2)
+    meta_file_label.configure(text="Drop multiple meta files here...", text_color="#64FFDA")
+
+def on_meta_leave(event):
+    if not hasattr(app, 'meta_selected_paths') or not app.meta_selected_paths:
+        meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+        meta_file_label.configure(text="No files chosen or Drag & Drop multiple here", text_color=MUTED_TEXT)
+
+def handle_meta_drop(event):
+    files = app.tk.splitlist(event.data)
+    if files:
+        cleaned_files = [f.strip('{}') for f in files]
+        process_selected_meta_files(cleaned_files)
+
+def clear_meta_files():
+    app.meta_selected_paths = []
+    meta_file_label.configure(text="No files chosen or Drag & Drop multiple here", text_color=MUTED_TEXT)
+    meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+    meta_clear_btn.grid_forget()
+    log_message("Meta data selections cleared.")
+
+def handle_consolidate():
+    log_message("Warning: 'Consolidate and Clean' functionality is currently under development.")
+
+# --- Output File & Folder Handlers ---
 def open_cleaned_file():
     if hasattr(app, 'last_output_path') and app.last_output_path and os.path.exists(app.last_output_path):
         try:
@@ -222,7 +273,6 @@ def open_cleaned_file():
         log_message("No generated file found to open.")
 
 def open_destination_folder():
-    """Opens the destination folder directory in file explorer across operating systems."""
     output_dir = Path.home() / "Desktop" / "Cleaned Data"
     output_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -249,11 +299,11 @@ try:
     myappid = 'StrategyDivision.StratDataCleaner.2026'
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
 except Exception as e:
-    print(f"Warning: Could not set AppUserModelID: {e})") 
+    print(f"Warning: Could not set AppUserModelID: {e}") 
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v1.0.11")
+app.title("Strat Data Cleaner v1.2.11")
 
 if HAS_DND:
     try:
@@ -268,7 +318,7 @@ except Exception as e:
     print(f"Warning: Could not load window icon: {e}")
 
 window_width = 620
-window_height = 585
+window_height = 700  # Expanded window height for the new Meta Data section
 screen_width = app.winfo_screenwidth()
 screen_height = app.winfo_screenheight()
 center_x = int((screen_width - window_width) / 2)
@@ -293,6 +343,9 @@ DB_COLOR = "#0096C7"
 DB_HOVER = "#00B4D8"
 DB_TEXT_COLOR = "#FFFFFF"   
 
+META_COLOR = "#7209B7"
+META_HOVER = "#9d4edd"
+
 OPEN_BTN_COLOR = "#2A9D8F"
 OPEN_BTN_HOVER = "#3AAFAF"
 OPEN_BTN_DISABLED = "#132238"
@@ -309,7 +362,7 @@ main_frame.pack(fill="both", expand=True, padx=25, pady=20)
 
 # 1. Header Title
 header_frame = ctk.CTkFrame(main_frame, fg_color="transparent")
-header_frame.pack(fill="x", pady=(0, 15))
+header_frame.pack(fill="x", pady=(0, 10))
 
 title_label = ctk.CTkLabel(
     header_frame,
@@ -327,9 +380,19 @@ subtitle_label = ctk.CTkLabel(
 )
 subtitle_label.pack(side="right", anchor="s")
 
-# 2. Upload Section
+# ==========================================
+# SECTION 1: RETAIL DATA SECTION
+# ==========================================
+retail_section_label = ctk.CTkLabel(
+    main_frame,
+    text="Retail Data Section",
+    font=("Helvetica", 13, "bold"),
+    text_color=WHITE
+)
+retail_section_label.pack(anchor="w", pady=(2, 4))
+
 upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
-upload_card.pack(fill="x", pady=(0, 15))
+upload_card.pack(fill="x", pady=(0, 8))
 upload_card.grid_columnconfigure(1, weight=1)
 
 if HAS_DND:
@@ -350,7 +413,7 @@ upload_btn = ctk.CTkButton(
     height=36,
     command=upload_file
 )
-upload_btn.grid(row=0, column=0, padx=15, pady=15)
+upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
 file_label_text = "No file chosen or Drag & Drop here" if HAS_DND else "No file chosen (Click Browse File)"
 file_label = ctk.CTkLabel(
@@ -381,18 +444,8 @@ clear_btn = ctk.CTkButton(
     command=clear_file
 )
 
-# 3. Action Section Title
-action_label = ctk.CTkLabel(
-    main_frame,
-    text="Select Cleaning Operation",
-    font=("Helvetica", 13, "bold"),
-    text_color=WHITE
-)
-action_label.pack(anchor="w", pady=(5, 8))
-
-# 4. Action Buttons Grid
 btn_frame = ctk.CTkFrame(main_frame, fg_color=NAVY_BLUE, corner_radius=0)
-btn_frame.pack(fill="x", pady=(0, 8))
+btn_frame.pack(fill="x", pady=(0, 10))
 btn_frame.grid_columnconfigure(0, weight=1)
 btn_frame.grid_columnconfigure(1, weight=1)
 
@@ -404,10 +457,10 @@ cadence_btn = ctk.CTkButton(
     hover_color=CADENCE_HOVER,
     text_color=WHITE,
     corner_radius=10,
-    height=42,
+    height=40,
     command=run_cadence_cleaner
 )
-cadence_btn.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+cadence_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
 database_btn = ctk.CTkButton(
     btn_frame,
@@ -417,12 +470,101 @@ database_btn = ctk.CTkButton(
     hover_color=DB_HOVER,
     text_color=DB_TEXT_COLOR,
     corner_radius=10,
-    height=42,
+    height=40,
     command=run_database_cleaner
 )
-database_btn.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+database_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
-# 5. Output Actions
+
+# ==========================================
+# SECTION 2: META DATA SECTION
+# ==========================================
+meta_section_label = ctk.CTkLabel(
+    main_frame,
+    text="Meta Data Section",
+    font=("Helvetica", 13, "bold"),
+    text_color=WHITE
+)
+meta_section_label.pack(anchor="w", pady=(4, 4))
+
+meta_upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
+meta_upload_card.pack(fill="x", pady=(0, 8))
+meta_upload_card.grid_columnconfigure(1, weight=1)
+
+if HAS_DND:
+    meta_upload_card.drop_target_register(DND_FILES)
+    meta_upload_card.dnd_bind('<<DropEnter>>', on_meta_enter)
+    meta_upload_card.dnd_bind('<<DropLeave>>', on_meta_leave)
+    meta_upload_card.dnd_bind('<<Drop>>', handle_meta_drop)
+
+meta_upload_btn = ctk.CTkButton(
+    meta_upload_card,
+    text="Browse Files",
+    font=("Arial", 12, "bold"),
+    fg_color=META_COLOR,
+    hover_color=META_HOVER,
+    text_color=WHITE,
+    corner_radius=8,
+    width=120,
+    height=36,
+    command=upload_meta_files
+)
+meta_upload_btn.grid(row=0, column=0, padx=12, pady=12)
+
+meta_file_label_text = "No files chosen or Drag & Drop multiple here" if HAS_DND else "No files chosen (Click Browse Files)"
+meta_file_label = ctk.CTkLabel(
+    meta_upload_card,
+    text=meta_file_label_text,
+    font=("Arial", 11),
+    text_color=MUTED_TEXT,
+    anchor="w"
+)
+meta_file_label.grid(row=0, column=1, sticky="w", padx=10)
+
+if HAS_DND:
+    meta_file_label.drop_target_register(DND_FILES)
+    meta_file_label.dnd_bind('<<DropEnter>>', on_meta_enter)
+    meta_file_label.dnd_bind('<<DropLeave>>', on_meta_leave)
+    meta_file_label.dnd_bind('<<Drop>>', handle_meta_drop)
+
+meta_clear_btn = ctk.CTkButton(
+    meta_upload_card, 
+    text="✖", 
+    font=("Arial", 12, "bold"),
+    fg_color="#C0392B", 
+    hover_color="#E74C3C", 
+    text_color=WHITE,
+    corner_radius=6, 
+    width=30, 
+    height=30, 
+    command=clear_meta_files
+)
+
+consolidate_btn = ctk.CTkButton(
+    main_frame,
+    text="Consolidate and Clean",
+    font=("Arial", 12, "bold"),
+    fg_color=META_COLOR,
+    hover_color=META_HOVER,
+    text_color=WHITE,
+    corner_radius=10,
+    height=40,
+    command=handle_consolidate
+)
+consolidate_btn.pack(fill="x", pady=(0, 10))
+
+
+# ==========================================
+# SECTION 3: OUTPUT & DESTINATION ACTIONS
+# ==========================================
+output_section_label = ctk.CTkLabel(
+    main_frame,
+    text="Output & Destination Actions",
+    font=("Helvetica", 13, "bold"),
+    text_color=WHITE
+)
+output_section_label.pack(anchor="w", pady=(4, 4))
+
 open_output_btn = ctk.CTkButton(
     main_frame,
     text="Open Cleaned File",
@@ -448,20 +590,23 @@ open_folder_btn = ctk.CTkButton(
     height=36,
     command=open_destination_folder
 )
-open_folder_btn.pack(fill="x", pady=(0, 5))
+open_folder_btn.pack(fill="x", pady=(0, 10))
 
-# 6. Inline Status Log Box
+
+# ==========================================
+# ACTIVITY LOG & FOOTER
+# ==========================================
 status_label = ctk.CTkLabel(
     main_frame,
     text="Activity Log",
     font=("Helvetica", 12, "bold"),
     text_color=WHITE
 )
-status_label.pack(anchor="w", pady=(10, 5))
+status_label.pack(anchor="w", pady=(2, 4))
 
 status_box = ctk.CTkTextbox(
     main_frame,
-    height=90,
+    height=100,
     corner_radius=8,
     fg_color=LOG_BG,
     text_color=LOG_TEXT,
@@ -469,7 +614,7 @@ status_box = ctk.CTkTextbox(
     border_width=1,
     border_color=BORDER_COLOR
 )
-status_box.pack(fill="x", pady=(0, 10))
+status_box.pack(fill="x", pady=(0, 6))
 
 status_box._textbox.tag_config("normal", foreground=LOG_TEXT)
 status_box._textbox.tag_config("success", foreground="#2ECC71")
@@ -477,16 +622,15 @@ status_box._textbox.tag_config("warning", foreground="#F1C40F")
 status_box._textbox.tag_config("error", foreground="#E74C3C")
 status_box._textbox.tag_config("processing", foreground="#3A86FF")
 
-status_box.insert("end", "[System] Application ready. Upload the file to begin.\n", "normal")
+status_box.insert("end", "[System] Application ready. Browse file to proceed.\n", "normal")
 status_box.configure(state="disabled")
 
-# 7. Footer Credit
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v1.0.11 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v1.2.11 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
-footer_label.pack(side="bottom", anchor="center", pady=(2, 0))
+footer_label.pack(side="bottom", anchor="center", pady=(0, 0))
 
 app.mainloop()
