@@ -28,12 +28,12 @@ jobs:
     - name: Build Windows Executable
       if: matrix.os == 'windows-latest'
       run: |
-        pyinstaller --noconsole --onefile --collect-all tkinterdnd2 --name="Strat Data Cleaner" --icon="assets/strat_data_cleaner.ico" --add-data "assets;assets" src/app.py
+        pyinstaller --noconsole --onefile  --name="Strat Data Cleaner" --icon="assets/strat_data_cleaner.ico" --add-data "assets;assets" src/app.py
         
     - name: Build macOS Application
       if: matrix.os == 'macos-latest'
       run: |
-        pyinstaller --noconsole --onedir --collect-all tkinterdnd2 --name="Strat Data Cleaner" --icon="assets/strat_data_cleaner.ico" --add-data "assets:assets" src/app.py
+        pyinstaller --noconsole --onedir  --name="Strat Data Cleaner" --icon="assets/strat_data_cleaner.ico" --add-data "assets:assets" src/app.py
         
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4
