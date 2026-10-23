@@ -55,7 +55,7 @@ def log_message(message):
         pass
     
     print(f"[Startup Log] {message}")
-
+#test
 # --- Loading Animation Controller ---
 animation_job = None
 dot_count = 0
