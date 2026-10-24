@@ -6,7 +6,7 @@ import ctypes
 from pathlib import Path
 import sys
 from PIL import Image
-
+#Please work please work
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
