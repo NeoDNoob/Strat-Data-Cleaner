@@ -6,6 +6,8 @@ import numpy as np
 import re
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+#Added comments so that it will push to github and trigger the workflow to build the exe file
+
 # =========================================================
 # CONFIGURATION & CONSTANTS
 # =========================================================
