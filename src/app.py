@@ -11,6 +11,7 @@ import traceback
 
 
 #Added comments so that it will push to github and trigger the workflow to build the exe file
+#NO DND
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
@@ -32,7 +33,7 @@ def load_icon(filename, size=(18, 18)):
     return None
 
 def log_message(message):
-    """Inserts a timestamped and color-coded message into the inline status box safely."""
+    """Inserts a timestamped aDNBD color-coded message into the inline status box safely."""
     global status_box
     try:
         if 'status_box' in globals() and status_box is not None:
