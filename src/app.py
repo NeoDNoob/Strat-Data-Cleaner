@@ -9,14 +9,6 @@ import sys
 from PIL import Image
 import traceback
 
-# --- Safe Drag-and-Drop Import Fallback ---
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-    HAS_DND = True
-except ImportError:
-    HAS_DND = False
-
-
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
@@ -68,16 +60,17 @@ def log_message(message):
 animation_job = None
 dot_count = 0
 
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
 
 def animate_button_text(button, base_text):
-    """Dynamically cycles through circular spinner frames while processing is active."""
+    """Cycles through animation frames without text while processing is active."""
     global animation_job, dot_count
     if getattr(app, 'is_processing', False):
         frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
-        button.configure(text=f"{frame}  {base_text}...")
+        # Enlarge font size to 16pt and display ONLY the broom animation
+        button.configure(font=("Arial", 16, "bold"), text=frame)
         dot_count += 1
-        animation_job = app.after(100, lambda: animate_button_text(button, base_text))
+        animation_job = app.after(150, lambda: animate_button_text(button, base_text))
 
 def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
     """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
@@ -179,33 +172,15 @@ def upload_file():
     else:
         log_message("Retail file selection cancelled.")
 
-def on_file_enter(event):
-    if not getattr(app, 'is_processing', False):
-        upload_card.configure(border_color="#64FFDA", border_width=2)
-        file_label.configure(text="Drop retail file here...", text_color="#64FFDA")
-
-def on_file_leave(event):
-    if not getattr(app, 'is_processing', False) and (not hasattr(app, 'selected_path') or not app.selected_path):
-        upload_card.configure(border_color=BORDER_COLOR, border_width=1)
-        file_label.configure(text="No file chosen or Drag & Drop here", text_color=MUTED_TEXT)
-
-def handle_drop(event):
-    files = app.tk.splitlist(event.data)
-    if files:
-        filename = files[0].strip('{}')
-        process_selected_file(filename)
-
 def clear_file():
     app.selected_path = None
-    file_label.configure(text="No file chosen or Drag & Drop here", text_color=MUTED_TEXT)
+    file_label.configure(text="No file chosen (Click Browse File)", text_color=MUTED_TEXT)
     upload_card.configure(border_color=BORDER_COLOR, border_width=1)
     clear_btn.grid_forget()  
     
-    # Disable retail cleaner buttons when cleared
     cadence_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
     database_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
     
-    # Only disable output open if no meta output exists either
     if not hasattr(app, 'last_output_path') or not app.last_output_path:
         open_output_btn.configure(
             state="disabled",
@@ -228,7 +203,6 @@ def process_selected_meta_files(filenames):
         app.meta_selected_paths = filenames
         meta_clear_btn.grid(row=0, column=2, padx=(5, 15))
         
-        # Enable Consolidate Button once files are loaded
         consolidate_btn.configure(
             state="normal",
             fg_color=META_COLOR,
@@ -246,29 +220,12 @@ def upload_meta_files():
     else:
         log_message("Meta data file selection cancelled.")
 
-def on_meta_enter(event):
-    if not getattr(app, 'is_processing', False):
-        meta_upload_card.configure(border_color="#64FFDA", border_width=2)
-        meta_file_label.configure(text="Drop multiple meta files here...", text_color="#64FFDA")
-
-def on_meta_leave(event):
-    if not getattr(app, 'is_processing', False) and (not hasattr(app, 'meta_selected_paths') or not app.meta_selected_paths):
-        meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
-        meta_file_label.configure(text="No files chosen or Drag & Drop multiple here", text_color=MUTED_TEXT)
-
-def handle_meta_drop(event):
-    files = app.tk.splitlist(event.data)
-    if files:
-        cleaned_files = [f.strip('{}') for f in files]
-        process_selected_meta_files(cleaned_files)
-
 def clear_meta_files():
     app.meta_selected_paths = []
-    meta_file_label.configure(text="No files chosen or Drag & Drop multiple here", text_color=MUTED_TEXT)
+    meta_file_label.configure(text="No files chosen (Click Browse Files)", text_color=MUTED_TEXT)
     meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
     meta_clear_btn.grid_forget()
     
-    # Disable Consolidate Button when cleared
     consolidate_btn.configure(
         state="disabled",
         fg_color=OPEN_BTN_DISABLED,
@@ -302,12 +259,12 @@ def run_consolidator_threaded():
     def background_consolidation():
         try:
             import time
-            time.sleep(1.5) # Simulating background processing task
+            time.sleep(1.5)
             
             output_dir = Path.home() / "Desktop" / "Cleaned Data"
             output_dir.mkdir(parents=True, exist_ok=True)
             output_path = str(output_dir / f"Consolidated_Meta_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-            row_count = len(app.meta_selected_paths) * 25 # Mock row count
+            row_count = len(app.meta_selected_paths) * 25
             
             app.after(0, lambda: handle_consolidation_success(row_count, output_path))
         except Exception as e:
@@ -396,11 +353,9 @@ def custom_askyesno(title, message):
     except Exception as e:
         print(f"Warning: Could not load dialog icon: {e}")
     
-    # Make it modal (blocks interaction with main window until closed)
     dialog.transient(app)
     dialog.grab_set()
     
-    # Center the dialog relative to the main app window
     app.update_idletasks()
     x = app.winfo_x() + (app.winfo_width() // 2) - (340 // 2)
     y = app.winfo_y() + (app.winfo_height() // 2) - (160 // 2)
@@ -416,7 +371,6 @@ def custom_askyesno(title, message):
         result[0] = False
         dialog.destroy()
         
-    # Dialog Message Label
     label = ctk.CTkLabel(
         dialog, 
         text=message, 
@@ -426,13 +380,11 @@ def custom_askyesno(title, message):
     )
     label.pack(pady=(25, 20), padx=20)
     
-    # Button Container Frame
     btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
     btn_frame.pack(fill="x", padx=20, pady=(0, 20))
     btn_frame.grid_columnconfigure(0, weight=1)
     btn_frame.grid_columnconfigure(1, weight=1)
     
-    # Yes Button
     yes_btn = ctk.CTkButton(
         btn_frame,
         text="Yes",
@@ -446,7 +398,6 @@ def custom_askyesno(title, message):
     )
     yes_btn.grid(row=0, column=0, sticky="ew", padx=(0, 6))
     
-    # No Button
     no_btn = ctk.CTkButton(
         btn_frame,
         text="No",
@@ -460,7 +411,6 @@ def custom_askyesno(title, message):
     )
     no_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
     
-    # Wait until the window is closed before returning the result
     dialog.wait_window()
     return result[0]
 
@@ -494,13 +444,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v1.3.17")
-
-if HAS_DND:
-    try:
-        TkinterDnD.require(app)
-    except Exception:
-        HAS_DND = False
+app.title("Strat Data Cleaner v1.5.17")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -611,7 +555,7 @@ upload_btn.grid(row=0, column=0, padx=12, pady=12)
 file_label_text = "No file chosen or Drag & Drop here" if HAS_DND else "No file chosen (Click Browse File)"
 file_label = ctk.CTkLabel(
     upload_card,
-    text=file_label_text,
+    text="No file chosen (Click Browse File)",
     font=("Arial", 11),
     text_color=MUTED_TEXT,
     anchor="w"
@@ -686,12 +630,6 @@ meta_upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, 
 meta_upload_card.pack(fill="x", pady=(0, 8))
 meta_upload_card.grid_columnconfigure(1, weight=1)
 
-if HAS_DND:
-    meta_upload_card.drop_target_register(DND_FILES)
-    meta_upload_card.dnd_bind('<<DropEnter>>', on_meta_enter)
-    meta_upload_card.dnd_bind('<<DropLeave>>', on_meta_leave)
-    meta_upload_card.dnd_bind('<<Drop>>', handle_meta_drop)
-
 meta_upload_btn = ctk.CTkButton(
     meta_upload_card,
     text="Browse Files",
@@ -706,21 +644,14 @@ meta_upload_btn = ctk.CTkButton(
 )
 meta_upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
-meta_file_label_text = "No files chosen or Drag & Drop multiple here" if HAS_DND else "No files chosen (Click Browse Files)"
 meta_file_label = ctk.CTkLabel(
     meta_upload_card,
-    text=meta_file_label_text,
+    text="No files chosen (Click Browse Files)",
     font=("Arial", 11),
     text_color=MUTED_TEXT,
     anchor="w"
 )
 meta_file_label.grid(row=0, column=1, sticky="w", padx=10)
-
-if HAS_DND:
-    meta_file_label.drop_target_register(DND_FILES)
-    meta_file_label.dnd_bind('<<DropEnter>>', on_meta_enter)
-    meta_file_label.dnd_bind('<<DropLeave>>', on_meta_leave)
-    meta_file_label.dnd_bind('<<Drop>>', handle_meta_drop)
 
 meta_clear_btn = ctk.CTkButton(
     meta_upload_card, 
@@ -823,7 +754,7 @@ status_box.configure(state="disabled")
 
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v1.3.17 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v1.5.17 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
