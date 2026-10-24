@@ -346,6 +346,7 @@ def custom_askyesno(title, message):
     dialog.resizable(False, False)
     dialog.configure(fg_color="#06101E")
     
+    # Set the dialog window icon to match the main application
     try:
         icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
         dialog.iconbitmap(str(icon_path))
@@ -531,6 +532,12 @@ upload_card = ctk.CTkFrame(main_frame, fg_color=CARD_BG, corner_radius=12, borde
 upload_card.pack(fill="x", pady=(0, 8))
 upload_card.grid_columnconfigure(1, weight=1)
 
+if HAS_DND:
+    upload_card.drop_target_register(DND_FILES)
+    upload_card.dnd_bind('<<DropEnter>>', on_file_enter)
+    upload_card.dnd_bind('<<DropLeave>>', on_file_leave)
+    upload_card.dnd_bind('<<Drop>>', handle_drop)
+
 upload_btn = ctk.CTkButton(
     upload_card,
     text="Browse File",
@@ -545,6 +552,7 @@ upload_btn = ctk.CTkButton(
 )
 upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
+file_label_text = "No file chosen or Drag & Drop here" if HAS_DND else "No file chosen (Click Browse File)"
 file_label = ctk.CTkLabel(
     upload_card,
     text="No file chosen (Click Browse File)",
@@ -553,6 +561,12 @@ file_label = ctk.CTkLabel(
     anchor="w"
 )
 file_label.grid(row=0, column=1, sticky="w", padx=10)
+
+if HAS_DND:
+    file_label.drop_target_register(DND_FILES)
+    file_label.dnd_bind('<<DropEnter>>', on_file_enter)
+    file_label.dnd_bind('<<DropLeave>>', on_file_leave)
+    file_label.dnd_bind('<<Drop>>', handle_drop)
 
 clear_btn = ctk.CTkButton(
     upload_card, 

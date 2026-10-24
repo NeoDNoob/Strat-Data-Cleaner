@@ -154,6 +154,7 @@ def create_category(store: str, brand: str) -> str:
             for item in allowed_brands:
                 if contains_term(brand, item):
                     return item
+
             return "OTHER BRANDS"
 
     return ""
@@ -419,6 +420,21 @@ def process_cadence(input_file_path):
     df["PRODUCT_TAG"] = [
         create_product_tag(cat, ef, i360, oura, raptor)
         for cat, ef, i360, oura, raptor in zip(df["CATEGORY"], ef_tags, i360_tags, oura_tags, raptor_tags)
+    ]
+    
+    # Generate individual tags internally to build the unified product tag
+    ef_tags = [
+        create_ef_tag(category, desc)
+        for category, desc in zip(df["CATEGORY"], long_desc_clean)
+    ]
+    i360_tags = [
+        create_i360_tag(category, desc)
+        for category, desc in zip(df["CATEGORY"], long_desc_clean)
+    ]
+    
+    df["PRODUCT_TAG"] = [
+        create_product_tag(cat, ef, i360)
+        for cat, ef, i360 in zip(df["CATEGORY"], ef_tags, i360_tags)
     ]
 
     # Reorder columns

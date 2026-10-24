@@ -15,7 +15,6 @@ from openpyxl.utils import get_column_letter
 # CONFIG & MAPPINGS
 # =========================================================
 
-# Dynamic Desktop Output Directory (Works on Windows, macOS, and Linux)
 OUTPUT_DIR = Path.home() / "Desktop" / "Cleaned Data"
 
 HEADER_SCAN_ROWS = 30
@@ -142,6 +141,14 @@ def to_text_id(value: Any) -> Any:
         return str(int(value)) if float(value).is_integer() else str(value)
     return str(value).strip()
 
+def clean_associate(value: Any) -> Optional[str]:
+    """Trims whitespace and capitalizes each word properly for associate names."""
+    if value is None or pd.isna(value):
+        return None
+    text = str(value).strip()
+    if not text or text.lower() == "nan":
+        return None
+    return " ".join(word.capitalize() for word in text.split())
 
 
 # =========================================================
@@ -213,36 +220,88 @@ def parse_date_value(value: Any) -> Optional[pd.Timestamp]:
     return None
 
 def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes offsetting sale and return pairs on the same receipt for the same customer."""
-    if not {"RECEIPT_NO", "CUSTOMER_NAME", "EXT_PRICE_W_TAX"}.issubset(df.columns):
+    """Removes offsetting sale and return pairs sharing customer_name, receipt_number, or general_notes[cite: 11]."""
+    if "EXT_PRICE_W_TAX" not in df.columns:
         return df
 
-    indices_to_drop = []
-    group_cols = ["RECEIPT_NO", "CUSTOMER_NAME"]
-    
-    for _, group in df.groupby(group_cols, dropna=False):
-        if len(group) < 2:
-            continue
-        
-        prices = group["EXT_PRICE_W_TAX"].values
-        index_labels = group.index.values
-        dropped_in_group = set()
-        
-        for i in range(len(prices)):
-            if i in dropped_in_group:
+    cols_to_check = [c for c in ["RECEIPT_NO", "CUSTOMER_NAME", "GENERAL_NOTES"] if c in df.columns]
+    if not cols_to_check:
+        return df
+
+    indices_to_drop = set()
+
+    for col in cols_to_check:
+        for _, group in df.groupby(col, dropna=False):
+            if len(group) < 2:
                 continue
-            for j in range(i + 1, len(prices)):
-                if j in dropped_in_group:
+            key_val = group[col].iloc[0]
+            if pd.isna(key_val) or str(key_val).strip() == "":
+                continue
+
+            prices = group["EXT_PRICE_W_TAX"].values
+            index_labels = group.index.values
+            dropped_in_subgroup = set()
+
+            for i in range(len(prices)):
+                if index_labels[i] in indices_to_drop or i in dropped_in_subgroup:
                     continue
-                if np.isclose(prices[i], -prices[j], atol=1e-5) and prices[i] != 0:
-                    dropped_in_group.add(i)
-                    dropped_in_group.add(j)
-                    indices_to_drop.extend([index_labels[i], index_labels[j]])
-                    break
-                    
+                for j in range(i + 1, len(prices)):
+                    if index_labels[j] in indices_to_drop or j in dropped_in_subgroup:
+                        continue
+                    if np.isclose(prices[i], -prices[j], atol=1e-5) and prices[i] != 0:
+                        dropped_in_subgroup.add(i)
+                        dropped_in_subgroup.add(j)
+                        indices_to_drop.add(index_labels[i])
+                        indices_to_drop.add(index_labels[j])
+                        break
+
     if indices_to_drop:
-        df = df.drop(index=indices_to_drop).reset_index(drop=True)
+        df = df.drop(index=list(indices_to_drop)).reset_index(drop=True)
     return df
+
+def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
+    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'[cite: 8, 11]."""
+    if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
+        return df
+
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+    long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
+
+    mask_akaso = (brand == "*") & long_desc.str.contains("Akaso", case=False, na=False)
+    df.loc[mask_akaso, "BRAND"] = "Akaso"
+    
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+
+    mask_plaud = brand.str.upper() == "PLAUD"
+    df.loc[mask_plaud, "BRAND"] = "PlaudAi"
+    
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+
+    mask_zz = brand == "ZZ"
+    if mask_zz.any():
+        has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
+        
+        if "EXT_PRICE_W_TAX" in df.columns:
+            zero_price = df["EXT_PRICE_W_TAX"].fillna(0) == 0
+            mask_remove = mask_zz & has_paper_bag & zero_price
+            df = df[~mask_remove].reset_index(drop=True)
+            
+            brand = df["BRAND"].fillna("").astype(str).str.strip()
+            long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
+            mask_zz = brand == "ZZ"
+            has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
+
+        mask_rename = mask_zz & ~has_paper_bag
+        if mask_rename.any():
+            def get_first_word(desc: str) -> str:
+                words = desc.strip().split()
+                if words:
+                    return words[0].capitalize()
+                return "ZZ"
+            df.loc[mask_rename, "BRAND"] = long_desc[mask_rename].apply(get_first_word)
+
+    return df
+
 
 # =========================================================
 # MAIN PROCESSOR (Called by GUI)
@@ -251,7 +310,6 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
 def process_database(input_file_path: str) -> tuple[int, str]:
     input_path = Path(input_file_path)
 
-    # 1. Read file
     if input_path.suffix.lower() in [".xls", ".xlsx"]:
         frames = pd.read_excel(input_path, sheet_name=None, header=None, dtype=object, engine="openpyxl", keep_default_na=False, na_values=[""])
     else:
@@ -268,22 +326,18 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     df = pd.concat(prepared, ignore_index=True) if len(prepared) > 1 else prepared[0]
 
-    # Clean cells and drop blank rows
     data_cols = [c for c in df.columns if not c.startswith("UNNAMED_")]
     for col in data_cols:
         df[col] = df[col].map(clean_cell)
     df = df.dropna(how="all", subset=data_cols).reset_index(drop=True)
 
-    # Check required columns
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required column(s): {missing}")
 
-    # Remove unwanted columns
     to_drop = [c for c in COLUMNS_TO_REMOVE if c in df.columns]
     df = df.drop(columns=to_drop)
 
-    # Standardize Store Names
     lookup = {normalize_store_key(k): v for k, v in STORE_NAME_MAP.items()}
     standard = {normalize_store_key(v): v for v in STORE_NAME_MAP.values()}
     original_stores = df["STORE_NAME"]
@@ -291,7 +345,6 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     mapped = keys.map(lookup).where(lambda s: s.notna(), keys.map(standard))
     df["STORE_NAME"] = mapped.where(mapped.notna(), original_stores)
 
-    # Add CHANNEL column
     def channel_of(name: Any) -> Optional[str]:
         if not isinstance(name, str):
             return None
@@ -300,17 +353,15 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     df.insert(0, "CHANNEL", df["STORE_NAME"].map(channel_of))
 
-    # Parse Dates & Calendar Columns
     df["RCPT_DATE"] = pd.to_datetime([parse_date_value(v) for v in df["RCPT_DATE"]], errors="coerce")
     
     dates = df["RCPT_DATE"]
     month_no = dates.dt.month.astype("Int64")
     month_name = month_no.map(lambda m: MONTH_ABBR[int(m) - 1] if pd.notna(m) else None)
     
-    # Format week number as "W" + week (e.g., W40) with safe handling for nulls
     iso_weeks = dates.dt.isocalendar().week
     week_no = pd.Series(
-        [f"W{int(w)}" if pd.notna(w) else None for w in iso_weeks], index=df.index
+        [f"W{int(w):02d}" if pd.notna(w) else None for w in iso_weeks], index=df.index
     )
     
     quarter_year = pd.Series([f"Q{d.quarter} {d.year}" if pd.notna(d) else None for d in dates], index=df.index)
@@ -321,17 +372,20 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     df.insert(pos + 2, "WEEK_NO", week_no)
     df.insert(pos + 3, "QUARTER_YEAR", quarter_year)
 
-    # Convert Types
     for col in TEXT_ID_COLUMNS:
         if col in df.columns:
             df[col] = df[col].map(to_text_id)
+
+    if "ASSOCIATE" in df.columns:
+        df["ASSOCIATE"] = df["ASSOCIATE"].map(clean_associate)
 
     for col in NUMERIC_COLUMNS:
         if col in df.columns:
             stripped = df[col].map(lambda v: v.replace(",", "").strip() if isinstance(v, str) else v)
             df[col] = pd.to_numeric(stripped, errors="coerce")
 
-    # --- PROPORTIONAL INTEREST ABSORPTION LOGIC ---
+    df = clean_special_brands(df)
+
     interest_mask = (
         df["BRAND"].str.contains("INTEREST", case=False, na=False) |
         df["LONG_DESCRIPTION"].str.contains("INTEREST", case=False, na=False) |
@@ -354,13 +408,10 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         df["EXT_PRICE_W_TAX"] = df["EXT_PRICE_W_TAX"] + (df["TOTAL_INTEREST"] * proportion)
         df = df.drop(columns=["TOTAL_INTEREST"])
 
-    # Remove offsetting sale-return pairs
     df = remove_sale_return_pairs(df)
 
-    # Filter out zero price rows
     df = df[df["EXT_PRICE_W_TAX"] != 0].copy()
 
-    # 2. Setup Destination Path with Auto-Incrementing Collision Check
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     current_date = datetime.date.today().strftime("%Y-%m-%d")
     base_filename = f"cleaned_database_{current_date}"
@@ -371,10 +422,8 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         output_file = OUTPUT_DIR / f"{base_filename} ({counter}).xlsx"
         counter += 1
 
-    # 3. Save to Excel
     df.to_excel(output_file, index=False, engine='openpyxl')
 
-    # 4. Format as official Excel Table
     wb = openpyxl.load_workbook(output_file)
     ws = wb.active
     
@@ -394,7 +443,6 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     tab.tableStyleInfo = style
     ws.add_table(tab)
     
-    # Format date and currency columns
     for col_idx, col_name in enumerate(df.columns, start=1):
         col_let = get_column_letter(col_idx)
         ws.column_dimensions[col_let].width = 18
