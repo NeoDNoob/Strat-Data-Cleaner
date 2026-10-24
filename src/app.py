@@ -9,6 +9,8 @@ import sys
 from PIL import Image
 import traceback
 
+
+#Added comments so that it will push to github and trigger the workflow to build the exe file
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")

@@ -11,6 +11,8 @@ import openpyxl
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
+#Added comments so that it will push to github and trigger the workflow to build the exe file
+
 # =========================================================
 # CONFIG & MAPPINGS
 # =========================================================
