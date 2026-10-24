@@ -60,7 +60,7 @@ def log_message(message):
 animation_job = None
 dot_count = 0
 
-SPINNER_FRAMES = ["🧹   ", " 🧹  ", "  🧹 ", "   🧹", "  🧹 ", " 🧹  "]
+SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
 
 def animate_button_text(button, base_text):
     """Cycles through animation frames without text while processing is active."""
@@ -68,7 +68,7 @@ def animate_button_text(button, base_text):
     if getattr(app, 'is_processing', False):
         frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
         # Enlarge font size to 18pt and display ONLY the broom animation
-        button.configure(font=("Arial", 18, "bold"), text=frame)
+        button.configure(font=("Arial", 20, "bold"), text=frame)
         dot_count += 1
         animation_job = app.after(150, lambda: animate_button_text(button, base_text))
 
