@@ -13,7 +13,6 @@ import cadence_cleaner
 importlib.reload(cadence_cleaner)
 
 #Added comments so that it will push to github and trigger the workflow to build the exe file
-#NO DND
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
@@ -386,6 +385,7 @@ def custom_askyesno(title, message):
     dialog.resizable(False, False)
     dialog.configure(fg_color="#06101E")
     
+    # Set the dialog window icon to match the main application
     try:
         icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
         dialog.iconbitmap(str(icon_path))
@@ -585,6 +585,7 @@ upload_btn = ctk.CTkButton(
 )
 upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
+file_label_text = "No file chosen or Drag & Drop here"
 file_label = ctk.CTkLabel(
     upload_card,
     text="No file chosen (Click Browse File)",

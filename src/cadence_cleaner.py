@@ -227,6 +227,7 @@ def create_category(store: str, brand: str) -> str:
             for item in allowed_brands:
                 if contains_term(brand, item):
                     return item
+
             return "OTHER BRANDS"
     return ""
 
@@ -699,7 +700,7 @@ def process_cadence(input_file_path):
         resolve_product_tag(bnd, desc)
         for bnd, desc in zip(df["BRAND"], current_long_desc)
     ]
-
+    
     tail = ["CATEGORY", "CHANNEL", "PRODUCT_TAG"]
     df = df[[c for c in df.columns if c not in tail] + tail]
 
