@@ -1,4 +1,5 @@
 import threading
+import importlib
 import customtkinter as ctk
 from tkinter import filedialog
 import datetime
@@ -8,7 +9,8 @@ from pathlib import Path
 import sys
 from PIL import Image
 import traceback
-
+import cadence_cleaner
+importlib.reload(cadence_cleaner)
 
 #Added comments so that it will push to github and trigger the workflow to build the exe file
 # --- Setup CustomTkinter Theme ---
@@ -62,17 +64,52 @@ def log_message(message):
 animation_job = None
 dot_count = 0
 
-SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 def animate_button_text(button, base_text):
     """Cycles through animation frames without text while processing is active."""
     global animation_job, dot_count
     if getattr(app, 'is_processing', False):
         frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
-        # Enlarge font size to 16pt and display ONLY the broom animation
-        button.configure(font=("Arial", 16, "bold"), text=frame)
+        button.configure(font=("Arial", 12, "bold"), text=frame)
         dot_count += 1
         animation_job = app.after(150, lambda: animate_button_text(button, base_text))
+
+def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
+    """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
+    if getattr(app, 'is_processing', False):
+        return
+        
+    if not hasattr(app, 'selected_path') or not app.selected_path:
+        log_message("Warning: Please upload a retail file before running the cleaner.")
+        return
+    
+    file_name = Path(app.selected_path).name
+    log_message(f"Processing file on '{file_name}'... Please wait.")
+    
+    app.is_processing = True
+    
+    upload_btn.configure(state="disabled")
+    clear_btn.configure(state="disabled")
+    other_btn = database_btn if button == cadence_btn else cadence_btn
+    other_btn.configure(state="disabled", fg_color="#132238", hover_color="#132238")
+    
+    button.configure(fg_color="#1B365D", hover_color="#1B365D")
+    
+    global dot_count
+    dot_count = 0
+    animate_button_text(button, base_text)
+
+    def background_execution():
+        try:
+            row_count, output_path = cleaner_func(app.selected_path)
+            app.after(0, lambda: handle_success(row_count, output_path, button, base_text, default_color, hover_color))
+        except Exception as e:
+            error_trace = traceback.format_exc()
+            app.after(0, lambda: handle_error(error_trace, button, base_text, default_color, hover_color))
+
+    threading.Thread(target=background_execution, daemon=True).start()
+
 
 def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
     """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
@@ -446,7 +483,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v1.5.17")
+app.title("Strat Data Cleaner v1.8.17")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -744,7 +781,7 @@ status_box.configure(state="disabled")
 
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v1.5.17 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v1.8.17 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
