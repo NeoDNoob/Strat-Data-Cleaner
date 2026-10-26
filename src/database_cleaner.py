@@ -315,6 +315,18 @@ def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
     brand = df["BRAND"].fillna("").astype(str).str.strip()
     long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
 
+    # Correct mis-entered JINKO brands using the first word of LONG_DESCRIPTION.
+    # This is intentionally scoped to JINKO so legitimate brands are not overwritten.
+    mask_jinko = brand.str.upper() == "JINKO"
+    if mask_jinko.any():
+        def first_word_as_brand(desc: str) -> str:
+            words = str(desc).strip().split()
+            return words[0].upper() if words else "JINKO"
+
+        df.loc[mask_jinko, "BRAND"] = long_desc[mask_jinko].apply(first_word_as_brand)
+
+    brand = df["BRAND"].fillna("").astype(str).str.strip()
+
     mask_akaso = (brand == "*") & long_desc.str.contains("Akaso", case=False, na=False)
     df.loc[mask_akaso, "BRAND"] = "Akaso"
     
