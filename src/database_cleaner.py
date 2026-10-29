@@ -476,8 +476,8 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     df = df[df["EXT_PRICE_W_TAX"] != 0].copy()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    current_date = datetime.date.today().strftime("%Y-%m-%d")
-    base_filename = f"cleaned_database_{current_date}"
+    yesterday_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    base_filename = f"cleaned_database_{yesterday_date}"
     output_file = OUTPUT_DIR / f"{base_filename}.xlsx"
     
     counter = 1

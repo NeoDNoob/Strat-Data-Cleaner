@@ -12,7 +12,6 @@ import traceback
 import cadence_cleaner
 importlib.reload(cadence_cleaner)
 
-#Added comments so that it will push to github and trigger the workflow to build the exe file
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("dark-blue")
@@ -33,8 +32,19 @@ def load_icon(filename, size=(18, 18)):
         return ctk.CTkImage(light_image=Image.open(path), dark_image=Image.open(path), size=size)
     return None
 
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+def animate_button_text(button, base_text):
+    """Cycles through animation frames without text while processing is active."""
+    global animation_job, dot_count
+    if getattr(app, 'is_processing', False):
+        frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
+        button.configure(font=("Arial", 12, "bold"), text=frame)
+        dot_count += 1
+        animation_job = app.after(150, lambda: animate_button_text(button, base_text))
+
 def log_message(message):
-    """Inserts a timestamped aDNBD color-coded message into the inline status box safely."""
+    """Inserts a timestamped color-coded message into the inline status box safely."""
     global status_box
     try:
         if 'status_box' in globals() and status_box is not None:
@@ -64,16 +74,6 @@ def log_message(message):
 animation_job = None
 dot_count = 0
 
-SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-def animate_button_text(button, base_text):
-    """Cycles through animation frames without text while processing is active."""
-    global animation_job, dot_count
-    if getattr(app, 'is_processing', False):
-        frame = SPINNER_FRAMES[dot_count % len(SPINNER_FRAMES)]
-        button.configure(font=("Arial", 12, "bold"), text=frame)
-        dot_count += 1
-        animation_job = app.after(150, lambda: animate_button_text(button, base_text))
 
 def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
     """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
@@ -91,44 +91,9 @@ def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_c
     
     upload_btn.configure(state="disabled")
     clear_btn.configure(state="disabled")
-    other_btn = database_btn if button == cadence_btn else cadence_btn
-    other_btn.configure(state="disabled", fg_color="#132238", hover_color="#132238")
-    
-    button.configure(fg_color="#1B365D", hover_color="#1B365D")
-    
-    global dot_count
-    dot_count = 0
-    animate_button_text(button, base_text)
-
-    def background_execution():
-        try:
-            row_count, output_path = cleaner_func(app.selected_path)
-            app.after(0, lambda: handle_success(row_count, output_path, button, base_text, default_color, hover_color))
-        except Exception as e:
-            error_trace = traceback.format_exc()
-            app.after(0, lambda: handle_error(error_trace, button, base_text, default_color, hover_color))
-
-    threading.Thread(target=background_execution, daemon=True).start()
-
-
-def run_cleaner_threaded(cleaner_func, button, base_text, default_color, hover_color):
-    """Runs the data cleaning task in a background thread and captures full tracebacks on failure."""
-    if getattr(app, 'is_processing', False):
-        return
-        
-    if not hasattr(app, 'selected_path') or not app.selected_path:
-        log_message("Warning: Please upload a retail file before running the cleaner.")
-        return
-    
-    file_name = Path(app.selected_path).name
-    log_message(f"Processing file on '{file_name}'... Please wait.")
-    
-    app.is_processing = True
-    
-    upload_btn.configure(state="disabled")
-    clear_btn.configure(state="disabled")
-    other_btn = database_btn if button == cadence_btn else cadence_btn
-    other_btn.configure(state="disabled", fg_color="#132238", hover_color="#132238")
+    for other_btn in (cadence_btn, database_btn, brand_performance_btn):
+        if other_btn != button:
+            other_btn.configure(state="disabled", fg_color="#132238", hover_color="#132238")
     
     button.configure(fg_color="#1B365D", hover_color="#1B365D")
     
@@ -153,10 +118,19 @@ def handle_success(row_count, output_path, button, base_text, default_color, hov
         app.after_cancel(animation_job)
     
     button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
-    other_btn = database_btn if button == cadence_btn else cadence_btn
-    other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
-                        hover_color=DB_HOVER if other_btn == database_btn else CADENCE_HOVER,
-                        state="normal")
+    for other_btn in (cadence_btn, database_btn, brand_performance_btn):
+        if other_btn != button:
+            color = (
+                DB_COLOR if other_btn == database_btn
+                else BRAND_COLOR if other_btn == brand_performance_btn
+                else CADENCE_COLOR
+            )
+            hover = (
+                DB_HOVER if other_btn == database_btn
+                else BRAND_HOVER if other_btn == brand_performance_btn
+                else CADENCE_HOVER
+            )
+            other_btn.configure(fg_color=color, hover_color=hover, state="normal")
     upload_btn.configure(state="normal")
     if hasattr(app, 'selected_path') and app.selected_path:
         clear_btn.configure(state="normal")
@@ -174,10 +148,19 @@ def handle_error(error_message, button, base_text, default_color, hover_color):
         app.after_cancel(animation_job)
         
     button.configure(text=base_text, fg_color=default_color, hover_color=hover_color)
-    other_btn = database_btn if button == cadence_btn else cadence_btn
-    other_btn.configure(fg_color=DB_COLOR if other_btn == database_btn else CADENCE_COLOR,
-                        hover_color=DB_HOVER if other_btn == database_btn else CADENCE_HOVER,
-                        state="normal")
+    for other_btn in (cadence_btn, database_btn, brand_performance_btn):
+        if other_btn != button:
+            color = (
+                DB_COLOR if other_btn == database_btn
+                else BRAND_COLOR if other_btn == brand_performance_btn
+                else CADENCE_COLOR
+            )
+            hover = (
+                DB_HOVER if other_btn == database_btn
+                else BRAND_HOVER if other_btn == brand_performance_btn
+                else CADENCE_HOVER
+            )
+            other_btn.configure(fg_color=color, hover_color=hover, state="normal")
     upload_btn.configure(state="normal")
     if hasattr(app, 'selected_path') and app.selected_path:
         clear_btn.configure(state="normal")
@@ -198,6 +181,7 @@ def process_selected_file(filename):
         # Enable retail cleaner buttons upon file selection
         cadence_btn.configure(state="normal", fg_color=CADENCE_COLOR, hover_color=CADENCE_HOVER)
         database_btn.configure(state="normal", fg_color=DB_COLOR, hover_color=DB_HOVER)
+        brand_performance_btn.configure(state="normal", fg_color=BRAND_COLOR, hover_color=BRAND_HOVER)
         
         log_message(f"Retail file loaded: {short_name}")
 
@@ -219,6 +203,7 @@ def clear_file():
     
     cadence_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
     database_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
+    brand_performance_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
     
     if not hasattr(app, 'last_output_path') or not app.last_output_path:
         open_output_btn.configure(
@@ -227,122 +212,6 @@ def clear_file():
             hover_color=OPEN_BTN_DISABLED
         )
     log_message("Retail file selection cleared.")
-
-# --- Meta Data File Handlers (Multi-file Support) ---
-def process_selected_meta_files(filenames):
-    if filenames:
-        count = len(filenames)
-        short_names = ", ".join([Path(f).name for f in filenames[:2]])
-        if count > 2:
-            display_text = f"Selected {count} files ({short_names}, ...)"
-        else:
-            display_text = f"Selected: {short_names}"
-        meta_file_label.configure(text=display_text, text_color="#64FFDA")
-        meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
-        app.meta_selected_paths = filenames
-        meta_clear_btn.grid(row=0, column=2, padx=(5, 15))
-        
-        consolidate_btn.configure(
-            state="normal",
-            fg_color=META_COLOR,
-            hover_color=META_HOVER
-        )
-        log_message(f"Meta data loaded: {count} file(s) selected.")
-
-def upload_meta_files():
-    filenames = filedialog.askopenfilenames(
-        title="Select Meta Data Files",
-        filetypes=(("Excel Files", "*.xlsx *.xls"), ("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*"))
-    )
-    if filenames:
-        process_selected_meta_files(filenames)
-    else:
-        log_message("Meta data file selection cancelled.")
-
-def clear_meta_files():
-    app.meta_selected_paths = []
-    meta_file_label.configure(text="No files chosen (Click Browse Files)", text_color=MUTED_TEXT)
-    meta_upload_card.configure(border_color=BORDER_COLOR, border_width=1)
-    meta_clear_btn.grid_forget()
-    
-    consolidate_btn.configure(
-        state="disabled",
-        fg_color=OPEN_BTN_DISABLED,
-        hover_color=OPEN_BTN_DISABLED
-    )
-    log_message("Meta data selections cleared.")
-
-# --- Threaded Consolidation Handler ---
-def run_consolidator_threaded():
-    """Runs meta data consolidation in a background thread to prevent UI freezing."""
-    if getattr(app, 'is_processing', False):
-        return
-        
-    if not hasattr(app, 'meta_selected_paths') or not app.meta_selected_paths:
-        log_message("Warning: Please select meta files before running consolidation.")
-        return
-    
-    file_count = len(app.meta_selected_paths)
-    log_message(f"Consolidating {file_count} meta file(s)... Please wait.")
-    
-    app.is_processing = True
-    
-    meta_upload_btn.configure(state="disabled")
-    meta_clear_btn.configure(state="disabled")
-    consolidate_btn.configure(fg_color="#1B365D", hover_color="#1B365D")
-    
-    global dot_count
-    dot_count = 0
-    animate_button_text(consolidate_btn, "Consolidating")
-
-    def background_consolidation():
-        try:
-            import time
-            time.sleep(1.5)
-            
-            output_dir = Path.home() / "Desktop" / "Cleaned Data"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            output_path = str(output_dir / f"Consolidated_Meta_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx")
-            row_count = len(app.meta_selected_paths) * 25
-            
-            app.after(0, lambda: handle_consolidation_success(row_count, output_path))
-        except Exception as e:
-            error_trace = traceback.format_exc()
-            app.after(0, lambda: handle_consolidation_error(error_trace))
-
-    threading.Thread(target=background_consolidation, daemon=True).start()
-
-def handle_consolidation_success(row_count, output_path):
-    global animation_job
-    app.is_processing = False
-    if animation_job:
-        app.after_cancel(animation_job)
-    
-    consolidate_btn.configure(text="Consolidate and Clean", fg_color=META_COLOR, hover_color=META_HOVER)
-    meta_upload_btn.configure(state="normal")
-    if hasattr(app, 'meta_selected_paths') and app.meta_selected_paths:
-        meta_clear_btn.configure(state="normal")
-
-    app.last_output_path = output_path
-    log_message(f"Successfully consolidated {row_count} items from meta files.")
-    log_message(f"Saved to: {output_path}")
-    
-    open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
-
-def handle_consolidation_error(error_message):
-    global animation_job
-    app.is_processing = False
-    if animation_job:
-        app.after_cancel(animation_job)
-        
-    consolidate_btn.configure(text="Consolidate and Clean", fg_color=META_COLOR, hover_color=META_HOVER)
-    meta_upload_btn.configure(state="normal")
-    if hasattr(app, 'meta_selected_paths') and app.meta_selected_paths:
-        meta_clear_btn.configure(state="normal")
-
-    log_message("Error during consolidation process:")
-    for line in error_message.strip().split("\n"):
-        log_message(line)
 
 # --- Output File & Folder Handlers ---
 def open_cleaned_file():
@@ -385,7 +254,6 @@ def custom_askyesno(title, message):
     dialog.resizable(False, False)
     dialog.configure(fg_color="#06101E")
     
-    # Set the dialog window icon to match the main application
     try:
         icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
         dialog.iconbitmap(str(icon_path))
@@ -468,11 +336,18 @@ def run_database_cleaner():
     else:
         log_message("Database Cleaner process cancelled by user.")
 
-def confirm_and_consolidate():
-    if custom_askyesno("Confirm Action", "Are you sure you want to consolidate and clean the selected meta files?"):
-        run_consolidator_threaded()
+def run_brand_performance_cleaner():
+    if custom_askyesno("Confirm Action", "Are you sure you want to run the Brand Performance Cleaner on this file?"):
+        from brand_performance_cleaner import process_brand_performance
+        run_cleaner_threaded(
+            process_brand_performance,
+            brand_performance_btn,
+            "Brand Performance Cleaner",
+            BRAND_COLOR,
+            BRAND_HOVER,
+        )
     else:
-        log_message("Meta data consolidation cancelled by user.")
+        log_message("Brand Performance Cleaner process cancelled by user.")
 
 # Taskbar ID & Window Icon Setup
 try:
@@ -483,7 +358,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v1.8.17")
+app.title("Strat Data Cleaner v2.8.17")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -518,6 +393,8 @@ CADENCE_HOVER = "#5B9AFF"
 DB_COLOR = "#0096C7"        
 DB_HOVER = "#00B4D8"
 DB_TEXT_COLOR = "#FFFFFF"   
+BRAND_COLOR = "#7209B7"
+BRAND_HOVER = "#9D4EDD"
 
 META_COLOR = "#7209B7"
 META_HOVER = "#9d4edd"
@@ -585,7 +462,6 @@ upload_btn = ctk.CTkButton(
 )
 upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
-file_label_text = "No file chosen or Drag & Drop here"
 file_label = ctk.CTkLabel(
     upload_card,
     text="No file chosen (Click Browse File)",
@@ -641,15 +517,29 @@ database_btn = ctk.CTkButton(
 )
 database_btn.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
+brand_performance_btn = ctk.CTkButton(
+    btn_frame,
+    text="Brand Performance Cleaner",
+    font=("Arial", 12, "bold"),
+    fg_color=OPEN_BTN_DISABLED,
+    hover_color=OPEN_BTN_DISABLED,
+    text_color=WHITE,
+    corner_radius=10,
+    height=40,
+    state="disabled",
+    command=run_brand_performance_cleaner
+)
+brand_performance_btn.grid(row=1, column=0, columnspan=2, sticky="ew", padx=0, pady=(6, 0))
+
 
 # ==========================================
-# SECTION 2: META DATA SECTION
+# SECTION 2: META DATA SECTION (DISABLED)
 # ==========================================
 meta_section_label = ctk.CTkLabel(
     main_frame,
-    text="Meta Data",
+    text="Meta Data (Coming Soon)",
     font=("Helvetica", 13, "bold"),
-    text_color=WHITE
+    text_color=MUTED_TEXT
 )
 meta_section_label.pack(anchor="w", pady=(4, 4))
 
@@ -661,37 +551,24 @@ meta_upload_btn = ctk.CTkButton(
     meta_upload_card,
     text="Browse Files",
     font=("Arial", 12, "bold"),
-    fg_color=META_COLOR,
-    hover_color=META_HOVER,
-    text_color=WHITE,
+    fg_color=OPEN_BTN_DISABLED,
+    hover_color=OPEN_BTN_DISABLED,
+    text_color=MUTED_TEXT,
     corner_radius=8,
     width=120,
     height=36,
-    command=upload_meta_files
+    state="disabled"
 )
 meta_upload_btn.grid(row=0, column=0, padx=12, pady=12)
 
 meta_file_label = ctk.CTkLabel(
     meta_upload_card,
-    text="No files chosen (Click Browse Files)",
+    text="Disabled for now",
     font=("Arial", 11),
     text_color=MUTED_TEXT,
     anchor="w"
 )
 meta_file_label.grid(row=0, column=1, sticky="w", padx=10)
-
-meta_clear_btn = ctk.CTkButton(
-    meta_upload_card, 
-    text="✕", 
-    font=("Arial", 12, "bold"),
-    fg_color="#0D1B2A", 
-    hover_color=CLOSE_HOVER, 
-    text_color=WHITE,
-    corner_radius=6, 
-    width=30, 
-    height=30, 
-    command=clear_meta_files
-)
 
 consolidate_btn = ctk.CTkButton(
     main_frame,
@@ -699,11 +576,10 @@ consolidate_btn = ctk.CTkButton(
     font=("Arial", 12, "bold"),
     fg_color=OPEN_BTN_DISABLED,
     hover_color=OPEN_BTN_DISABLED,
-    text_color=WHITE,
+    text_color=MUTED_TEXT,
     corner_radius=10,
     height=40,
-    state="disabled",
-    command=confirm_and_consolidate
+    state="disabled"
 )
 consolidate_btn.pack(fill="x", pady=(0, 10))
 
@@ -781,7 +657,7 @@ status_box.configure(state="disabled")
 
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v1.8.17 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v2.8.17 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
