@@ -11,8 +11,6 @@ import openpyxl
 from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
-# Added comments so that it will push to github and trigger the workflow to build the exe file
-
 # =========================================================
 # CONFIG & MAPPINGS
 # =========================================================
@@ -157,47 +155,6 @@ def clean_associate(value: Any) -> Optional[str]:
 # ETL FUNCTIONS
 # =========================================================
 
-def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
-    """Applies specific brand renaming and filtering logic for 'ZZ' and 'Plaud' variants."""
-    if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
-        return df
-
-    brand = df["BRAND"].fillna("").astype(str).str.strip()
-    long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
-
-    # 1. Normalize Plaud variants to PlaudAi
-    mask_plaud = brand.str.upper().str.contains("PLAUD", na=False)
-    df.loc[mask_plaud, "BRAND"] = "PlaudAi"
-    
-    brand = df["BRAND"].fillna("").astype(str).str.strip()
-
-    # 2 & 3. ZZ brand rules
-    mask_zz = brand.str.upper() == "ZZ"
-    if mask_zz.any():
-        has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
-        
-        if "EXT_PRICE_W_TAX" in df.columns:
-            zero_price = pd.to_numeric(df["EXT_PRICE_W_TAX"], errors="coerce").fillna(0) == 0
-            # Delete ZZ entries containing paper bag with zero price
-            df = df[~(mask_zz & has_paper_bag & zero_price)].reset_index(drop=True)
-            
-            # Refresh masks after dropping rows
-            brand = df["BRAND"].fillna("").astype(str).str.strip()
-            long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
-            mask_zz = brand.str.upper() == "ZZ"
-            has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
-
-        # Rename ZZ entries that do NOT contain paper bag to the first word of long description
-        mask_rename = mask_zz & ~has_paper_bag
-        if mask_rename.any():
-            def get_first_word(desc: str) -> str:
-                words = desc.strip().split()
-                return words[0].capitalize() if words else "ZZ"
-            df.loc[mask_rename, "BRAND"] = long_desc[mask_rename].apply(get_first_word)
-
-    return df
-
-
 def find_header_row(raw: pd.DataFrame) -> Optional[int]:
     known = set(EXPECTED_COLUMNS) | set(COLUMN_ALIASES)
     best_idx, best_score = None, 0
@@ -262,61 +219,15 @@ def parse_date_value(value: Any) -> Optional[pd.Timestamp]:
             return None
     return None
 
-def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes offsetting sale and return pairs sharing receipt, customer, or notes, with matching brand and long_description."""
-    if "EXT_PRICE_W_TAX" not in df.columns:
-        return df
-
-    cols_to_check = [c for c in ["RECEIPT_NO", "CUSTOMER_NAME", "GENERAL_NOTES"] if c in df.columns]
-    if not cols_to_check:
-        return df
-
-    indices_to_drop = set()
-
-    for col in cols_to_check:
-        for _, group in df.groupby(col, dropna=False):
-            if len(group) < 2:
-                continue
-
-            key_val = group[col].iloc[0]
-            if pd.isna(key_val) or str(key_val).strip() == "":
-                continue
-
-            prices = group["EXT_PRICE_W_TAX"].values
-            brands = group["BRAND"].fillna("").astype(str).str.strip().values if "BRAND" in group.columns else None
-            descs = group["LONG_DESCRIPTION"].fillna("").astype(str).str.strip().values if "LONG_DESCRIPTION" in group.columns else None
-            index_labels = group.index.values
-            dropped_in_subgroup = set()
-
-            for i in range(len(prices)):
-                if index_labels[i] in indices_to_drop or i in dropped_in_subgroup:
-                    continue
-                for j in range(i + 1, len(prices)):
-                    if index_labels[j] in indices_to_drop or j in dropped_in_subgroup:
-                        continue
-
-                    brand_match = (brands is None) or (brands[i] == brands[j])
-                    desc_match = (descs is None) or (descs[i] == descs[j])
-
-                    if brand_match and desc_match and np.isclose(prices[i], -prices[j], atol=1e-5) and prices[i] != 0:
-                        dropped_in_subgroup.update({i, j})
-                        indices_to_drop.update({index_labels[i], index_labels[j]})
-                        break
-
-    if indices_to_drop:
-        df = df.drop(index=list(indices_to_drop)).reset_index(drop=True)
-    return df
 
 def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
-    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'[cite: 8, 11]."""
+    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'."""
     if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
         return df
 
     brand = df["BRAND"].fillna("").astype(str).str.strip()
     long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
 
-    # Correct mis-entered JINKO brands using the first word of LONG_DESCRIPTION.
-    # This is intentionally scoped to JINKO so legitimate brands are not overwritten.
     mask_jinko = brand.str.upper() == "JINKO"
     if mask_jinko.any():
         def first_word_as_brand(desc: str) -> str:
@@ -398,7 +309,6 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     to_drop = [c for c in COLUMNS_TO_REMOVE if c in df.columns]
     df = df.drop(columns=to_drop)
 
-    # Apply special brand cleaning rules for ZZ and PlaudAi
     df = clean_special_brands(df)
 
     lookup = {normalize_store_key(k): v for k, v in STORE_NAME_MAP.items()}
@@ -449,6 +359,14 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     df = clean_special_brands(df)
 
+    # =========================================================
+    # INTEREST ALLOCATION LOGIC (fixed):
+    # Adds interest amount to the highest-priced product in the receipt.
+    # - Blank CUSTOMER_NAME no longer drops interest rows
+    # - Interest with no product row on its receipt is kept, not deleted
+    # =========================================================
+    total_before_interest = df["EXT_PRICE_W_TAX"].sum()
+
     interest_mask = (
         df["BRAND"].str.contains("INTEREST", case=False, na=False) |
         df["LONG_DESCRIPTION"].str.contains("INTEREST", case=False, na=False) |
@@ -456,22 +374,30 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     )
 
     if interest_mask.any() and "RECEIPT_NO" in df.columns and "CUSTOMER_NAME" in df.columns:
-        interest_df = df[interest_mask].copy()
-        interest_grouped = interest_df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"], as_index=False)["EXT_PRICE_W_TAX"].sum()
-        interest_grouped = interest_grouped.rename(columns={"EXT_PRICE_W_TAX": "TOTAL_INTEREST"})
+        keys = ["RECEIPT_NO", "CUSTOMER_NAME"]
+        df["CUSTOMER_NAME"] = df["CUSTOMER_NAME"].fillna("")  # blank names are no longer dropped by groupby
 
-        df = df[~interest_mask].copy()
+        interest = df[interest_mask]
+        main = df[~interest_mask].copy()
 
-        df = df.merge(interest_grouped, on=["RECEIPT_NO", "CUSTOMER_NAME"], how="left")
-        df["TOTAL_INTEREST"] = df["TOTAL_INTEREST"].fillna(0)
+        totals = interest.groupby(keys)["EXT_PRICE_W_TAX"].sum()
+        amounts = main["EXT_PRICE_W_TAX"].fillna(0)
+        target = amounts.groupby([main["RECEIPT_NO"], main["CUSTOMER_NAME"]]).idxmax()
 
-        receipt_totals = df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"])["EXT_PRICE_W_TAX"].transform("sum")
-        proportion = df["EXT_PRICE_W_TAX"] / receipt_totals.replace(0, 1)
+        matched = totals.index.intersection(target.index)
+        rows = target.loc[matched].values
+        main.loc[rows, "EXT_PRICE_W_TAX"] = (
+            main.loc[rows, "EXT_PRICE_W_TAX"].fillna(0).values + totals.loc[matched].values
+        )
 
-        df["EXT_PRICE_W_TAX"] = df["EXT_PRICE_W_TAX"] + (df["TOTAL_INTEREST"] * proportion)
-        df = df.drop(columns=["TOTAL_INTEREST"])
+        # interest with no product row on its receipt is kept as its own row
+        is_matched = interest.set_index(keys).index.isin(matched)
+        df = pd.concat([main, interest[~is_matched]], ignore_index=True)
 
-    df = remove_sale_return_pairs(df)
+    total_after_interest = df["EXT_PRICE_W_TAX"].sum()
+    if abs(total_before_interest - total_after_interest) > 0.01:
+        print(f"WARNING: total changed during interest step: "
+              f"{total_before_interest:,.2f} -> {total_after_interest:,.2f}")
 
     df = df[df["EXT_PRICE_W_TAX"] != 0].copy()
 

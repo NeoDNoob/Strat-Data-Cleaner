@@ -358,7 +358,7 @@ except Exception as e:
 
 # --- Main Application Setup ---
 app = ctk.CTk()
-app.title("Strat Data Cleaner v2.8.17")
+app.title("Strat Data Cleaner v2.8.19")
 
 icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
 try:
@@ -657,7 +657,7 @@ status_box.configure(state="disabled")
 
 footer_label = ctk.CTkLabel(
     main_frame,
-    text="v2.8.17 • Created by the Strategy Division - Data Analytics Team, 2026",
+    text="v2.8.19 • Created by the Strategy Division - Data Analytics Team, 2026",
     font=("Arial", 11, "italic"),
     text_color=MUTED_TEXT
 )
