@@ -62,7 +62,6 @@ TARGET_BRANDS = [
     "Vulcrox",
     "Sony",
     "Anker",
-    "Havit",
     "Loop",
 ]
 
