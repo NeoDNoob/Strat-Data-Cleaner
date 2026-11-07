@@ -1,5 +1,4 @@
 import threading
-import importlib
 import customtkinter as ctk
 from tkinter import filedialog
 import datetime
@@ -9,8 +8,6 @@ from pathlib import Path
 import sys
 from PIL import Image
 import traceback
-import cadence_cleaner
-importlib.reload(cadence_cleaner)
 
 # --- Setup CustomTkinter Theme ---
 ctk.set_appearance_mode("Dark")
