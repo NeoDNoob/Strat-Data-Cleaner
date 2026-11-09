@@ -39,20 +39,12 @@ STORE_TYPO_FIXES = {
     "ALTITUDE PIONER": "ALTITUDE PIONEER",
 }
 
-DIRECT_STORES = [
-    "ECOFLOW",
-    "OURA",
-    "RAPTOR",
-    "INSTA360",
-]
+DIRECT_STORES = ["ECOFLOW", "OURA", "RAPTOR", "INSTA360"]
 
 EF_TAG_DEFAULT = "EF Others"
 I360_TAG_DEFAULT = "I360 Others"
-
-EF_EXCLUDE_TERMS = [
-    "CABLE", "CABLES", "ADAPTER", "ADAPTOR", "CHARGER", "FLASHLIGHT", 
-    "BAG", "COVER", "TROLLEY", "PROTECTOR", "MOUNT", "DC"
-]
+RAPTOR_TAG_DEFAULT = "RAPTOR OTHERS"
+OURA_TAG_DEFAULT = "OURA OTHERS"
 
 BRAND_RULES = {
     "ALTITUDE PIONEER": ["DJI", "INSTA360", "ECOFLOW", "RAPTOR", "YABER", "ENABOT"],
@@ -60,7 +52,6 @@ BRAND_RULES = {
     "ALTITUDE": ["ECOFLOW", "INSTA360", "DJI","RINGCONN", "OURA", "BOOX", "COROS","PLAUDAI", "RAPTOR","SHOKZ","YABER","FUJIFILM", "RAYNEO","ENABOT","POLAR","GARMIN","OCCULI","EARQUIS","VULCROX","SONY"],
     "UG": ["ECOFLOW", "INSTA360", "DJI", "RINGCONN","ANKER","OURA","SHOKZ","YABER","GARMIN","PLAUDAI","RAYNEO","BOOX","COROS","POLAR","RAPTOR","OCCULLI","EARQUIS","SONY"],
 }
-
 
 # =========================================================
 # HELPER FUNCTIONS: TEXT & HEADER PROCESSING
@@ -71,7 +62,6 @@ def normalize_header(value) -> str:
         return ""
     return str(value).strip().upper().replace("\n", " ")
 
-
 def clean_text(series: pd.Series) -> pd.Series:
     return (
         series.fillna("")
@@ -81,37 +71,28 @@ def clean_text(series: pd.Series) -> pd.Series:
         .str.replace(r"\s+", " ", regex=True)
     )
 
-
 def contains_term(text: str, term: str) -> bool:
     pattern = rf"(?<![A-Z0-9]){re.escape(term)}(?![A-Z0-9])"
     return bool(re.search(pattern, text))
 
-
-def fix_store_typo(store: str) -> str:
+def fix_store_typos_vectorized(series: pd.Series) -> pd.Series:
+    res = series.copy()
     for wrong, correct in STORE_TYPO_FIXES.items():
-        if store == wrong or store.startswith(wrong + " "):
-            return correct + store[len(wrong):]
-    return store
-
+        mask = res.str.startswith(wrong)
+        if mask.any():
+            res.loc[mask] = res.loc[mask].str.replace(wrong, correct, regex=False)
+    return res
 
 def read_data_file(file_path: Path, header=None, nrows=None) -> pd.DataFrame:
     if file_path.suffix.lower() in [".xls", ".xlsx"]:
         return pd.read_excel(file_path, header=header, nrows=nrows)
     return pd.read_csv(file_path, header=header, nrows=nrows)
 
-
 # =========================================================
 # MONOBRAND TAGGING LOGIC
 # =========================================================
 
-EF_TAG_DEFAULT = "EF Others"
-I360_TAG_DEFAULT = "I360 Others"
-RAPTOR_TAG_DEFAULT = "RAPTOR OTHERS"
-OURA_TAG_DEFAULT = "OURA OTHERS"
-
-
-def create_raptor_tag(long_description: str) -> str:
-    desc = str(long_description).upper()
+def create_raptor_tag(desc: str) -> str:
     if any(k in desc for k in ["TOOLBOX", "TOOL BOX"]):
         return "TOOLBOX"
     elif "COOLER" in desc:
@@ -132,9 +113,7 @@ def create_raptor_tag(long_description: str) -> str:
         return "STORAGES"
     return RAPTOR_TAG_DEFAULT
 
-
-def create_ef_tag(long_description: str) -> str:
-    desc = str(long_description).upper()
+def create_ef_tag(desc: str) -> str:
     accessory_terms = ["CABLE", "CABLES", "ADAPTOR", "ADAPTORS", "ADAPTER", "ADAPTERS", "FLASHLIGHT", "FLASHLIGHTS"]
     if any(term in desc for term in accessory_terms):
         return EF_TAG_DEFAULT
@@ -146,9 +125,7 @@ def create_ef_tag(long_description: str) -> str:
         return "River Series"
     return EF_TAG_DEFAULT
 
-
-def create_i360_tag(long_description: str) -> str:
-    desc = str(long_description).upper()
+def create_i360_tag(desc: str) -> str:
     if "BUNDLE" not in desc and "LIMITED EDITION" not in desc:
         return I360_TAG_DEFAULT
     if "ACE PRO 2" in desc:
@@ -165,9 +142,7 @@ def create_i360_tag(long_description: str) -> str:
         return "X6"
     return I360_TAG_DEFAULT
 
-
-def create_oura_tag(long_description: str) -> str:
-    desc = str(long_description).upper()
+def create_oura_tag(desc: str) -> str:
     if any(k in desc for k in ["CHARGER", "PROTECTOR", "SIZING KIT", "SIZING", "ACCESSORY", "ACCESSORIES"]):
         return "OURA ACCESSORIES"
     elif any(k in desc for k in ["RING 4", "RING4"]):
@@ -176,22 +151,21 @@ def create_oura_tag(long_description: str) -> str:
         return "OURA RING 5"
     return OURA_TAG_DEFAULT
 
-
 def resolve_product_tag(brand: str, long_description: str) -> str:
     bnd = str(brand).strip().upper()
+    desc = str(long_description).upper()
     if bnd == "RAPTOR":
-        return create_raptor_tag(long_description)
+        return create_raptor_tag(desc)
     elif bnd == "ECOFLOW":
-        return create_ef_tag(long_description)
+        return create_ef_tag(desc)
     elif bnd == "INSTA360":
-        return create_i360_tag(long_description)
+        return create_i360_tag(desc)
     elif bnd == "OURA":
-        return create_oura_tag(long_description)
+        return create_oura_tag(desc)
     return ""
 
-
 # =========================================================
-# HELPER FUNCTIONS: DATA CLEANING & FILTERING
+# DATA CLEANING & OPTIMIZED FILTERING WITH AUDIT LOGGING
 # =========================================================
 
 def create_channel(store: str) -> str:
@@ -200,7 +174,6 @@ def create_channel(store: str) -> str:
     if store.startswith("ALTITUDE PIONEER"):
         return "ALTITUDE PIONEER"
     return store.split()[0]
-
 
 def create_category(store: str, brand: str) -> str:
     if not store:
@@ -218,8 +191,7 @@ def create_category(store: str, brand: str) -> str:
             return "OTHER BRANDS"
     return ""
 
-
-def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
+def clean_special_brands(df: pd.DataFrame, audit_log: list) -> pd.DataFrame:
     if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
         return df
     brand = df["BRAND"].fillna("").astype(str).str.strip()
@@ -240,7 +212,13 @@ def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
         has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
         if "EXT_PRICE_W_TAX" in df.columns:
             zero_price = df["EXT_PRICE_W_TAX"].fillna(0) == 0
-            df = df[~(mask_zz & has_paper_bag & zero_price)].reset_index(drop=True)
+            to_remove_mask = mask_zz & has_paper_bag & zero_price
+            if to_remove_mask.any():
+                removed_rows = df[to_remove_mask].copy()
+                removed_rows["REMOVAL_REASON"] = "ZZ Brand Paper Bag with Zero Price"
+                audit_log.append(removed_rows)
+                df = df[~to_remove_mask].reset_index(drop=True)
+
             brand = df["BRAND"].fillna("").astype(str).str.strip()
             long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
             mask_zz = brand == "ZZ"
@@ -254,12 +232,7 @@ def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
             df.loc[mask_rename, "BRAND"] = long_desc[mask_rename].apply(get_first_word)
     return df
 
-
-def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Removes matching sale-return pairs, AND removes any unmatched return 
-    rows (orphan returns with no matching sale counterpart).
-    """
+def remove_sale_return_pairs(df: pd.DataFrame, audit_log: list) -> pd.DataFrame:
     if "EXT_PRICE_W_TAX" not in df.columns:
         return df
 
@@ -267,66 +240,76 @@ def remove_sale_return_pairs(df: pd.DataFrame) -> pd.DataFrame:
     if not cols_to_check:
         return df
 
-    indices_to_drop = set()
+    if not (df["EXT_PRICE_W_TAX"] < 0).any():
+        return df
+
+    drop_reasons = {}
 
     for col in cols_to_check:
-        for _, group in df.groupby(col, dropna=False):
-            if len(group) < 1:
-                continue
-            key_val = group[col].iloc[0]
-            if pd.isna(key_val) or str(key_val).strip() == "":
+        groups_with_returns = df[df["EXT_PRICE_W_TAX"] < 0][col].dropna().unique()
+        if len(groups_with_returns) == 0:
+            continue
+
+        relevant_df = df[df[col].isin(groups_with_returns)]
+
+        for key_val, group in relevant_df.groupby(col, dropna=True):
+            if str(key_val).strip() == "":
                 continue
 
             prices = group["EXT_PRICE_W_TAX"].values
+            index_labels = group.index.values
+
+            neg_indices = np.where(prices < 0)[0]
+            if len(neg_indices) == 0:
+                continue
+
+            pos_indices = np.where(prices > 0)[0]
             qtys = group["SOLD_QTY"].values if "SOLD_QTY" in group.columns else None
             brands = group["BRAND"].fillna("").astype(str).str.strip().values if "BRAND" in group.columns else None
             descs = group["LONG_DESCRIPTION"].fillna("").astype(str).str.strip().values if "LONG_DESCRIPTION" in group.columns else None
-            index_labels = group.index.values
-            
-            matched_indices = set()
 
-            # Pass 1: Match sale-return pairs and mark both for removal
-            for i in range(len(prices)):
-                if prices[i] >= 0:
+            matched_pos = set()
+
+            for i in neg_indices:
+                if index_labels[i] in drop_reasons:
                     continue
-                for j in range(len(prices)):
-                    if i == j or j in matched_indices:
+                for j in pos_indices:
+                    if j in matched_pos or index_labels[j] in drop_reasons:
                         continue
-                    if prices[j] <= 0:
-                        continue
-                    
+
                     brand_match = (brands is None) or (brands[i] == brands[j])
                     desc_match = (descs is None) or (descs[i] == descs[j])
-                    price_match = np.isclose(prices[i], -prices[j], atol=1e-5)
-                    
+                    price_match = abs(prices[i] + prices[j]) < 1e-5
+
                     qty_match = True
                     if qtys is not None:
-                        qty_match = np.isclose(qtys[i], -qtys[j], atol=1e-5)
+                        qty_match = abs(qtys[i] + qtys[j]) < 1e-5
 
                     if brand_match and desc_match and price_match and qty_match:
-                        matched_indices.add(j)
-                        matched_indices.add(i)
-                        indices_to_drop.update({index_labels[i], index_labels[j]})
+                        matched_pos.add(j)
+                        drop_reasons[index_labels[i]] = "Matched Sale-Return Pair (Return Row)"
+                        drop_reasons[index_labels[j]] = "Matched Sale-Return Pair (Sale Counterpart)"
                         break
 
-            # Pass 2: Remove any remaining unmatched (orphan) returns
-            for i in range(len(prices)):
-                if prices[i] < 0 and index_labels[i] not in indices_to_drop:
-                    indices_to_drop.add(index_labels[i])
+    if drop_reasons:
+        indices_to_drop = list(drop_reasons.keys())
+        removed_df = df.loc[indices_to_drop].copy()
+        removed_df["REMOVAL_REASON"] = removed_df.index.map(drop_reasons)
+        audit_log.append(removed_df)
+        df = df.drop(index=indices_to_drop).reset_index(drop=True)
 
-    if indices_to_drop:
-        df = df.drop(index=list(indices_to_drop)).reset_index(drop=True)
     return df
 
-
 # =========================================================
-# MAIN PROCESSING FUNCTION (Called by GUI)
+# MAIN PROCESSING FUNCTION
 # =========================================================
 
 def process_cadence(input_file_path):
     input_path = Path(input_file_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found:\n{input_path}")
+
+    audit_log = []
 
     preview = read_data_file(input_path, header=None, nrows=100)
     required = set(REQUIRED_COLUMNS)
@@ -353,7 +336,7 @@ def process_cadence(input_file_path):
     if "SOLD_QTY" in df.columns:
         df["SOLD_QTY"] = pd.to_numeric(df["SOLD_QTY"], errors="coerce").fillna(0)
 
-    df = clean_special_brands(df)
+    df = clean_special_brands(df, audit_log)
 
     long_desc_clean = clean_text(df["LONG_DESCRIPTION"]) if "LONG_DESCRIPTION" in df.columns else pd.Series("", index=df.index)
     interest_mask = df["BRAND"].eq("INTEREST") | long_desc_clean.str.contains("INTEREST", case=False, na=False)
@@ -372,10 +355,17 @@ def process_cadence(input_file_path):
 
     to_drop = [c for c in COLUMNS_TO_DROP if c in df.columns]
     df = df.drop(columns=to_drop)
-    df = df[df["EXT_PRICE_W_TAX"] != 0].copy().reset_index(drop=True)
 
-    df = remove_sale_return_pairs(df)
-    df["STORE_NAME"] = clean_text(df["STORE_NAME"]).apply(fix_store_typo)
+    # Log and filter zero-price rows
+    zero_price_mask = df["EXT_PRICE_W_TAX"] == 0
+    if zero_price_mask.any():
+        zero_df = df[zero_price_mask].copy()
+        zero_df["REMOVAL_REASON"] = "Zero Sale Amount / Price"
+        audit_log.append(zero_df)
+        df = df[~zero_price_mask].copy().reset_index(drop=True)
+
+    df = remove_sale_return_pairs(df, audit_log)
+    df["STORE_NAME"] = fix_store_typos_vectorized(clean_text(df["STORE_NAME"]))
     df["BRAND"] = clean_text(df["BRAND"])
 
     df["CHANNEL"] = df["STORE_NAME"].apply(create_channel)
@@ -400,27 +390,28 @@ def process_cadence(input_file_path):
         output_file = OUTPUT_DIR / f"{base_filename} ({counter}).xlsx"
         counter += 1
 
-    df.to_excel(output_file, index=False, engine='openpyxl')
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Cadence Data", index=False)
+        if audit_log:
+            audit_df = pd.concat(audit_log, ignore_index=True)
+            cols = ["REMOVAL_REASON"] + [c for c in audit_df.columns if c != "REMOVAL_REASON"]
+            audit_df = audit_df[cols]
+            audit_df.to_excel(writer, sheet_name="Removal Audit Log", index=False)
+        else:
+            pd.DataFrame(columns=["REMOVAL_REASON", "NOTE"]).to_excel(writer, sheet_name="Removal Audit Log", index=False)
 
     wb = openpyxl.load_workbook(output_file)
-    ws = wb.active
-    ws.title = "Cleaned Cadence Data"
-    
-    max_row = ws.max_row
-    max_column = ws.max_column
-    col_letter = openpyxl.utils.get_column_letter(max_column)
-    table_range = f"A1:{col_letter}{max_row}"
+    ws_main = wb["Cleaned Cadence Data"]
+    table_range = f"A1:{openpyxl.utils.get_column_letter(ws_main.max_column)}{ws_main.max_row}"
+    tab_main = Table(displayName="CadenceCleanTable", ref=table_range)
+    tab_main.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    ws_main.add_table(tab_main)
 
-    tab = Table(displayName="CadenceCleanTable", ref=table_range)
-    tab.tableStyleInfo = TableStyleInfo(
-        name="TableStyleMedium2", 
-        showFirstColumn=False, 
-        showLastColumn=False, 
-        showRowStripes=True, 
-        showColumnStripes=False
-    )
-    ws.add_table(tab)
-    
+    ws_audit = wb["Removal Audit Log"]
+    audit_table_range = f"A1:{openpyxl.utils.get_column_letter(ws_audit.max_column)}{ws_audit.max_row}"
+    tab_audit = Table(displayName="RemovalAuditTable", ref=audit_table_range)
+    tab_audit.tableStyleInfo = TableStyleInfo(name="TableStyleMedium7", showRowStripes=True)
+    ws_audit.add_table(tab_audit)
+
     wb.save(output_file)
-
     return len(df), str(output_file)
