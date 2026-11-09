@@ -8,8 +8,8 @@ from typing import Any, Optional
 import numpy as np
 import pandas as pd
 import openpyxl
-from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
+from openpyxl.worksheet.table import Table, TableStyleInfo
 
 # =========================================================
 # CONFIG & MAPPINGS
@@ -29,9 +29,7 @@ EXPECTED_COLUMNS = [
     "UNIT_FINAL_PRICE_W_TAX", "EXT_PRICE_W_TAX", "GENERAL_NOTES",
 ]
 
-COLUMN_ALIASES = {
-    "UNIT_ORGI_PRICE_W_TAX": "UNIT_ORIG_PRICE_W_TAX",
-}
+COLUMN_ALIASES = {"UNIT_ORGI_PRICE_W_TAX": "UNIT_ORIG_PRICE_W_TAX"}
 
 COLUMNS_TO_REMOVE = [
     "DATABASE_NAME", "MOBILE_NUMBER", "SERIAL_NO", "CARD_TYPE", "AUTHORIZATION_CODE",
@@ -109,7 +107,6 @@ RE_ISO = re.compile(r"^(\d{4})-(\d{1,2})-(\d{1,2})(?:[T ].*)?$")
 RE_SLASH = re.compile(r"^(\d{1,2})/(\d{1,2})/(\d{4}|\d{2})$")
 RE_SERIAL_TEXT = re.compile(r"^\d{5}(?:\.\d+)?$")
 
-
 # =========================================================
 # HELPERS
 # =========================================================
@@ -142,18 +139,12 @@ def to_text_id(value: Any) -> Any:
     return str(value).strip()
 
 def clean_associate(value: Any) -> Optional[str]:
-    """Trims whitespace and capitalizes each word properly for associate names."""
     if value is None or pd.isna(value):
         return None
     text = str(value).strip()
     if not text or text.lower() == "nan":
         return None
     return " ".join(word.capitalize() for word in text.split())
-
-
-# =========================================================
-# ETL FUNCTIONS
-# =========================================================
 
 def find_header_row(raw: pd.DataFrame) -> Optional[int]:
     known = set(EXPECTED_COLUMNS) | set(COLUMN_ALIASES)
@@ -219,9 +210,7 @@ def parse_date_value(value: Any) -> Optional[pd.Timestamp]:
             return None
     return None
 
-
-def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
-    """Applies specific brand renaming and filtering logic for '*', 'ZZ', and 'Plaud'."""
+def clean_special_brands(df: pd.DataFrame, audit_log: list) -> pd.DataFrame:
     if "BRAND" not in df.columns or "LONG_DESCRIPTION" not in df.columns:
         return df
 
@@ -233,29 +222,28 @@ def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
         def first_word_as_brand(desc: str) -> str:
             words = str(desc).strip().split()
             return words[0].upper() if words else "JINKO"
-
         df.loc[mask_jinko, "BRAND"] = long_desc[mask_jinko].apply(first_word_as_brand)
 
     brand = df["BRAND"].fillna("").astype(str).str.strip()
-
     mask_akaso = (brand == "*") & long_desc.str.contains("Akaso", case=False, na=False)
     df.loc[mask_akaso, "BRAND"] = "Akaso"
     
     brand = df["BRAND"].fillna("").astype(str).str.strip()
-
     mask_plaud = brand.str.upper() == "PLAUD"
     df.loc[mask_plaud, "BRAND"] = "PlaudAi"
     
     brand = df["BRAND"].fillna("").astype(str).str.strip()
-
     mask_zz = brand == "ZZ"
     if mask_zz.any():
         has_paper_bag = long_desc.str.contains("Paper Bag", case=False, na=False)
-        
         if "EXT_PRICE_W_TAX" in df.columns:
             zero_price = df["EXT_PRICE_W_TAX"].fillna(0) == 0
-            mask_remove = mask_zz & has_paper_bag & zero_price
-            df = df[~mask_remove].reset_index(drop=True)
+            to_remove_mask = mask_zz & has_paper_bag & zero_price
+            if to_remove_mask.any():
+                removed_rows = df[to_remove_mask].copy()
+                removed_rows["REMOVAL_REASON"] = "ZZ Brand Paper Bag with Zero Price"
+                audit_log.append(removed_rows)
+                df = df[~to_remove_mask].reset_index(drop=True)
             
             brand = df["BRAND"].fillna("").astype(str).str.strip()
             long_desc = df["LONG_DESCRIPTION"].fillna("").astype(str)
@@ -266,20 +254,86 @@ def clean_special_brands(df: pd.DataFrame) -> pd.DataFrame:
         if mask_rename.any():
             def get_first_word(desc: str) -> str:
                 words = desc.strip().split()
-                if words:
-                    return words[0].capitalize()
-                return "ZZ"
+                return words[0].capitalize() if words else "ZZ"
             df.loc[mask_rename, "BRAND"] = long_desc[mask_rename].apply(get_first_word)
 
     return df
 
+def remove_sale_return_pairs(df: pd.DataFrame, audit_log: list) -> pd.DataFrame:
+    if "EXT_PRICE_W_TAX" not in df.columns:
+        return df
+
+    cols_to_check = [c for c in ["RECEIPT_NO", "CUSTOMER_NAME", "GENERAL_NOTES"] if c in df.columns]
+    if not cols_to_check:
+        return df
+
+    if not (df["EXT_PRICE_W_TAX"] < 0).any():
+        return df
+
+    drop_reasons = {}
+
+    for col in cols_to_check:
+        groups_with_returns = df[df["EXT_PRICE_W_TAX"] < 0][col].dropna().unique()
+        if len(groups_with_returns) == 0:
+            continue
+
+        relevant_df = df[df[col].isin(groups_with_returns)]
+
+        for key_val, group in relevant_df.groupby(col, dropna=True):
+            if str(key_val).strip() == "":
+                continue
+
+            prices = group["EXT_PRICE_W_TAX"].values
+            index_labels = group.index.values
+
+            neg_indices = np.where(prices < 0)[0]
+            if len(neg_indices) == 0:
+                continue
+
+            pos_indices = np.where(prices > 0)[0]
+            qtys = group["SOLD_QTY"].values if "SOLD_QTY" in group.columns else None
+            brands = group["BRAND"].fillna("").astype(str).str.strip().values if "BRAND" in group.columns else None
+            descs = group["LONG_DESCRIPTION"].fillna("").astype(str).str.strip().values if "LONG_DESCRIPTION" in group.columns else None
+
+            matched_pos = set()
+
+            for i in neg_indices:
+                if index_labels[i] in drop_reasons:
+                    continue
+                for j in pos_indices:
+                    if j in matched_pos or index_labels[j] in drop_reasons:
+                        continue
+
+                    brand_match = (brands is None) or (brands[i] == brands[j])
+                    desc_match = (descs is None) or (descs[i] == descs[j])
+                    price_match = abs(prices[i] + prices[j]) < 1e-5
+
+                    qty_match = True
+                    if qtys is not None:
+                        qty_match = abs(qtys[i] + qtys[j]) < 1e-5
+
+                    if brand_match and desc_match and price_match and qty_match:
+                        matched_pos.add(j)
+                        drop_reasons[index_labels[i]] = "Matched Sale-Return Pair (Return Row)"
+                        drop_reasons[index_labels[j]] = "Matched Sale-Return Pair (Sale Counterpart)"
+                        break
+
+    if drop_reasons:
+        indices_to_drop = list(drop_reasons.keys())
+        removed_df = df.loc[indices_to_drop].copy()
+        removed_df["REMOVAL_REASON"] = removed_df.index.map(drop_reasons)
+        audit_log.append(removed_df)
+        df = df.drop(index=indices_to_drop).reset_index(drop=True)
+
+    return df
 
 # =========================================================
-# MAIN PROCESSOR (Called by GUI)
+# MAIN PROCESSOR
 # =========================================================
 
 def process_database(input_file_path: str) -> tuple[int, str]:
     input_path = Path(input_file_path)
+    audit_log = []
 
     if input_path.suffix.lower() in [".xls", ".xlsx"]:
         frames = pd.read_excel(input_path, sheet_name=None, header=None, dtype=object, engine="openpyxl", keep_default_na=False, na_values=[""])
@@ -309,7 +363,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     to_drop = [c for c in COLUMNS_TO_REMOVE if c in df.columns]
     df = df.drop(columns=to_drop)
 
-    df = clean_special_brands(df)
+    df = clean_special_brands(df, audit_log)
 
     lookup = {normalize_store_key(k): v for k, v in STORE_NAME_MAP.items()}
     standard = {normalize_store_key(v): v for v in STORE_NAME_MAP.values()}
@@ -331,12 +385,8 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     dates = df["RCPT_DATE"]
     month_no = dates.dt.month.astype("Int64")
     month_name = month_no.map(lambda m: MONTH_ABBR[int(m) - 1] if pd.notna(m) else None)
-    
     iso_weeks = dates.dt.isocalendar().week
-    week_no = pd.Series(
-        [f"W{int(w):02d}" if pd.notna(w) else None for w in iso_weeks], index=df.index
-    )
-    
+    week_no = pd.Series([f"W{int(w):02d}" if pd.notna(w) else None for w in iso_weeks], index=df.index)
     quarter_year = pd.Series([f"Q{d.quarter} {d.year}" if pd.notna(d) else None for d in dates], index=df.index)
 
     pos = df.columns.get_loc("RCPT_DATE") + 1
@@ -357,15 +407,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
             stripped = df[col].map(lambda v: v.replace(",", "").strip() if isinstance(v, str) else v)
             df[col] = pd.to_numeric(stripped, errors="coerce")
 
-    df = clean_special_brands(df)
-
-    # =========================================================
-    # INTEREST ALLOCATION LOGIC (fixed):
-    # Adds interest amount to the highest-priced product in the receipt.
-    # - Blank CUSTOMER_NAME no longer drops interest rows
-    # - Interest with no product row on its receipt is kept, not deleted
-    # =========================================================
-    total_before_interest = df["EXT_PRICE_W_TAX"].sum()
+    df = clean_special_brands(df, audit_log)
 
     interest_mask = (
         df["BRAND"].str.contains("INTEREST", case=False, na=False) |
@@ -375,7 +417,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     if interest_mask.any() and "RECEIPT_NO" in df.columns and "CUSTOMER_NAME" in df.columns:
         keys = ["RECEIPT_NO", "CUSTOMER_NAME"]
-        df["CUSTOMER_NAME"] = df["CUSTOMER_NAME"].fillna("")  # blank names are no longer dropped by groupby
+        df["CUSTOMER_NAME"] = df["CUSTOMER_NAME"].fillna("")
 
         interest = df[interest_mask]
         main = df[~interest_mask].copy()
@@ -390,16 +432,17 @@ def process_database(input_file_path: str) -> tuple[int, str]:
             main.loc[rows, "EXT_PRICE_W_TAX"].fillna(0).values + totals.loc[matched].values
         )
 
-        # interest with no product row on its receipt is kept as its own row
         is_matched = interest.set_index(keys).index.isin(matched)
         df = pd.concat([main, interest[~is_matched]], ignore_index=True)
 
-    total_after_interest = df["EXT_PRICE_W_TAX"].sum()
-    if abs(total_before_interest - total_after_interest) > 0.01:
-        print(f"WARNING: total changed during interest step: "
-              f"{total_before_interest:,.2f} -> {total_after_interest:,.2f}")
+    df = remove_sale_return_pairs(df, audit_log)
 
-    df = df[df["EXT_PRICE_W_TAX"] != 0].copy()
+    zero_price_mask = df["EXT_PRICE_W_TAX"] == 0
+    if zero_price_mask.any():
+        zero_df = df[zero_price_mask].copy()
+        zero_df["REMOVAL_REASON"] = "Zero Sale Amount / Price"
+        audit_log.append(zero_df)
+        df = df[~zero_price_mask].copy()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     yesterday_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
@@ -411,37 +454,28 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         output_file = OUTPUT_DIR / f"{base_filename} ({counter}).xlsx"
         counter += 1
 
-    df.to_excel(output_file, index=False, engine='openpyxl')
+    with pd.ExcelWriter(output_file, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Cleaned Database Data", index=False)
+        if audit_log:
+            audit_df = pd.concat(audit_log, ignore_index=True)
+            cols = ["REMOVAL_REASON"] + [c for c in audit_df.columns if c != "REMOVAL_REASON"]
+            audit_df = audit_df[cols]
+            audit_df.to_excel(writer, sheet_name="Removal Audit Log", index=False)
+        else:
+            pd.DataFrame(columns=["REMOVAL_REASON", "NOTE"]).to_excel(writer, sheet_name="Removal Audit Log", index=False)
 
     wb = openpyxl.load_workbook(output_file)
-    ws = wb.active
-    
-    max_row = ws.max_row
-    max_col = ws.max_column
-    col_letter = get_column_letter(max_col)
-    table_range = f"A1:{col_letter}{max_row}"
+    ws_main = wb["Cleaned Database Data"]
+    table_range = f"A1:{get_column_letter(ws_main.max_column)}{ws_main.max_row}"
+    tab_main = Table(displayName="DatabaseCleanTable", ref=table_range)
+    tab_main.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showRowStripes=True)
+    ws_main.add_table(tab_main)
 
-    tab = openpyxl.worksheet.table.Table(displayName="DatabaseCleanTable", ref=table_range)
-    style = openpyxl.worksheet.table.TableStyleInfo(
-        name="TableStyleMedium2", 
-        showFirstColumn=False, 
-        showLastColumn=False, 
-        showRowStripes=True, 
-        showColumnStripes=False
-    )
-    tab.tableStyleInfo = style
-    ws.add_table(tab)
-    
-    for col_idx, col_name in enumerate(df.columns, start=1):
-        col_let = get_column_letter(col_idx)
-        ws.column_dimensions[col_let].width = 18
-        if col_name == "RCPT_DATE":
-            for cell in ws[col_let][1:]:
-                cell.number_format = "mm/dd/yyyy"
-        elif col_name == "EXT_PRICE_W_TAX":
-            for cell in ws[col_let][1:]:
-                cell.number_format = "#,##0.00"
+    ws_audit = wb["Removal Audit Log"]
+    audit_table_range = f"A1:{get_column_letter(ws_audit.max_column)}{ws_audit.max_row}"
+    tab_audit = Table(displayName="RemovalAuditTable", ref=audit_table_range)
+    tab_audit.tableStyleInfo = TableStyleInfo(name="TableStyleMedium7", showRowStripes=True)
+    ws_audit.add_table(tab_audit)
 
     wb.save(output_file)
-
     return len(df), str(output_file)
