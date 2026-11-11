@@ -83,12 +83,24 @@ def to_text_id(value: Any) -> Any:
         return str(int(value)) if float(value).is_integer() else str(value)
     return str(value).strip()
 
+DATE_DISPLAY_FORMAT = "mm/dd/yyyy"   # how receipt dates are shown in Excel (MM/DD/YYYY)
+
+
+def format_date_columns(ws) -> None:
+    """Show RCPT_DATE as MM/DD/YYYY. Cells remain real Excel dates, so sorting, filters and pivots still work."""
+    headers = [cell.value for cell in ws[1]]
+    for col_idx, name in enumerate(headers, start=1):
+        if name == "RCPT_DATE":
+            for row_idx in range(2, ws.max_row + 1):
+                ws.cell(row=row_idx, column=col_idx).number_format = DATE_DISPLAY_FORMAT
+
+
 def dates_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
-    """Return a copy whose date columns are formatted as MM/DD/YYYY strings for Excel output."""
+    """Return a copy whose date columns hold calendar dates only (no time-of-day) for Excel output."""
     frame = frame.copy()
     for col in frame.columns:
         if col == "RCPT_DATE" or pd.api.types.is_datetime64_any_dtype(frame[col]):
-            frame[col] = pd.to_datetime(frame[col], errors="coerce").dt.strftime("%m/%d/%Y")
+            frame[col] = pd.to_datetime(frame[col], errors="coerce").dt.date
     return frame
 
 def fuzzy_normalize_customers(df: pd.DataFrame, customer_col="CUSTOMER_NAME", threshold=0.85) -> pd.DataFrame:
@@ -611,5 +623,7 @@ def process_existing_database(input_file_path: str) -> tuple[int, str]:
     tab_audit.tableStyleInfo = TableStyleInfo(name="TableStyleMedium7", showRowStripes=True)
     ws_audit.add_table(tab_audit)
 
+    format_date_columns(ws_main)
+    format_date_columns(ws_audit)
     wb.save(output_file)
     return len(df), str(output_file)
