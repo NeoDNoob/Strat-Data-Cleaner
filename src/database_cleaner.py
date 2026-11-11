@@ -64,6 +64,7 @@ STORE_NAME_MAP = {
     "ALTITUDE GREENBELT 5": "Altitude Greenbelt",
     "ALTITUDE MEGAMALL": "Altitude Megamall",
     "ALTITUDE PIONEER": "Altitude Pioneer",
+    "ALTITUDE PARK TRIANGLE": "Altitude Park Triangle",
     "ALTITUDE RPM": "Altitude Robinsons Place Manila",
     "ALTITUDE TRINOMA": "Altitude Trinoma",
     "ALTITUDE CLARK": "Altitude Clark",
