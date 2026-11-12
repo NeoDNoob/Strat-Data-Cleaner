@@ -55,6 +55,14 @@ STORE_TYPO_FIXES = {
     "ALTITUDE PIONER": "ALTITUDE PIONEER",
 }
 
+# Store masking: every row of a masked store is moved to its target store name (matched on the start of the name,
+# ignoring case and extra spaces). Other stores are never touched.
+STORE_MASK = {
+    "RAP FESTIVAL MALL": "RAPTOR FESTIVAL MALL",
+    "RAP GATEWAY MALL": "RAPTOR GATEWAY",
+    "RAP SM NORTH EDSA": "RAPTOR SM NORTH EDSA",
+}
+
 TARGET_BRANDS = [
     "EcoFlow", "Insta360", "DJI", "Ringconn", "Oura", "Boox", "Coros",
     "PlaudAI", "Raptor", "Shokz", "Yaber", "Fujifilm", "Rayneo", "Enabot",
@@ -512,6 +520,78 @@ def remove_customer_sale_return_pairs(df: pd.DataFrame, audit_log: list, price_c
 
 
 # =========================================================
+# STORE MASKING
+# =========================================================
+
+def mask_store_names(series: pd.Series) -> pd.Series:
+    """Moves all rows of each STORE_MASK store to its target store; every other value is left exactly as it was."""
+    def _mask(value):
+        if not isinstance(value, str):
+            return value
+        norm = re.sub(r"\s+", " ", value.strip().upper())
+        for wrong, correct in STORE_MASK.items():
+            if norm.startswith(wrong):
+                return correct + norm[len(wrong):]
+        return value
+    return series.map(_mask)
+
+
+# =========================================================
+# INTEREST AUDIT (read-only)
+# Records what the interest step did so it can be checked in the "Removal Audit Log" sheet.
+# Nothing here changes the data or the interest calculation.
+# =========================================================
+
+def _receipt_key(frame: pd.DataFrame) -> pd.Series:
+    """One text key per receipt + customer (same grouping the interest step uses)."""
+    return frame["RECEIPT_NO"].astype(str) + "||" + frame["CUSTOMER_NAME"].fillna("").astype(str)
+
+
+def _sale_sums_by_receipt(frame: pd.DataFrame, price_col: str) -> pd.Series:
+    """Total sale amount per receipt + customer. Called before and after the interest step."""
+    amounts = pd.to_numeric(frame[price_col], errors="coerce").fillna(0)
+    return amounts.groupby(_receipt_key(frame).to_numpy()).sum()
+
+
+def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
+                         applied_reason, unapplied_reason, applied_mask=None):
+    """
+    One audit row per interest line, with:
+      INTEREST_AMOUNT          this line's interest amount
+      RECEIPT_INTEREST_TOTAL   all interest on the receipt + customer      (first line of each receipt only)
+      INTEREST_ADDED_TO_SALES  how much the sale lines actually went up    (first line of each receipt only)
+      INTEREST_VARIANCE        total minus added; should be 0.00           (first line of each receipt only)
+      INTEREST_CHECK           OK / MISMATCH / NOT APPLIED                 (every line)
+    Receipt-level figures are filled once per receipt so the columns can be summed without double counting.
+    """
+    audit = interest_rows.copy()
+    key = _receipt_key(audit)
+    amount = pd.to_numeric(audit[price_col], errors="coerce").fillna(0)
+
+    receipt_total = key.map(amount.groupby(key.to_numpy()).sum()).astype(float)
+    added = key.map(sums_after.sub(sums_before, fill_value=0)).astype(float).fillna(0)
+    variance = receipt_total - added
+
+    if applied_mask is None:
+        applied = key.isin(sums_before.index).to_numpy()
+    else:
+        applied = np.asarray(applied_mask, dtype=bool)
+    off_total = variance.abs().to_numpy() > 0.005
+    first = ~key.duplicated().to_numpy()
+
+    audit["REMOVAL_REASON"] = np.where(applied, applied_reason, unapplied_reason)
+    audit["INTEREST_AMOUNT"] = amount.round(2).to_numpy()
+    for col, vals in (("RECEIPT_INTEREST_TOTAL", receipt_total),
+                      ("INTEREST_ADDED_TO_SALES", added),
+                      ("INTEREST_VARIANCE", variance)):
+        audit[col] = np.where(first, vals.round(2).to_numpy(), np.nan)
+    audit["INTEREST_CHECK"] = np.where(~applied, "NOT APPLIED", np.where(off_total, "MISMATCH", "OK"))
+    return audit
+
+
+
+
+# =========================================================
 # MAIN PROCESSING FUNCTION
 # =========================================================
 
@@ -543,6 +623,9 @@ def process_brand_performance(input_file_path):
     if missing:
         raise KeyError(f"Missing required column(s): {missing}")
 
+    # Store masking runs first, so everything below (daily store totals, audit rows, output) sees the target store
+    df["STORE_NAME"] = mask_store_names(df["STORE_NAME"])
+
     # Convert to numeric early to prevent comparison TypeErrors
     df["EXT_PRICE_W_TAX"] = pd.to_numeric(
         df["EXT_PRICE_W_TAX"].astype(str).str.replace(",", "").str.strip(), 
@@ -565,12 +648,18 @@ def process_brand_performance(input_file_path):
         interest_grouped = interest_df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"], as_index=False)["EXT_PRICE_W_TAX"].sum()
         interest_grouped = interest_grouped.rename(columns={"EXT_PRICE_W_TAX": "TOTAL_INTEREST"})
         df = df[~interest_mask].copy()
+        interest_sales_before = _sale_sums_by_receipt(df, "EXT_PRICE_W_TAX")  # audit only
         df = df.merge(interest_grouped, on=["RECEIPT_NO", "CUSTOMER_NAME"], how="left")
         df["TOTAL_INTEREST"] = df["TOTAL_INTEREST"].fillna(0)
         receipt_totals = df.groupby(["RECEIPT_NO", "CUSTOMER_NAME"])["EXT_PRICE_W_TAX"].transform("sum")
         proportion = df["EXT_PRICE_W_TAX"] / receipt_totals.replace(0, 1)
         df["EXT_PRICE_W_TAX"] += df["TOTAL_INTEREST"] * proportion
         df = df.drop(columns=["TOTAL_INTEREST"])
+        audit_log.append(build_interest_audit(
+            interest_df, interest_sales_before, _sale_sums_by_receipt(df, "EXT_PRICE_W_TAX"), "EXT_PRICE_W_TAX",
+            applied_reason="Interest Line - Spread Across Receipt Sale Lines",
+            unapplied_reason="Interest Line - NOT ADDED (no sale line on receipt; interest amount dropped)",
+        ))
 
     to_drop = [c for c in COLUMNS_TO_DROP if c in df.columns]
     df = df.drop(columns=to_drop)

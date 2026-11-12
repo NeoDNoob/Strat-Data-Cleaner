@@ -1007,6 +1007,22 @@ def _finish_common():
         clear_btn.configure(state="normal")
 
 
+def _clean_key(file_path, cleaner_label):
+    """Identity of one clean: the file NAME (case-insensitive) plus the cleaner used."""
+    return (Path(file_path).name.casefold(), cleaner_label)
+
+
+def already_cleaned(file_path, cleaner_label):
+    """True when this file name was already cleaned successfully with this cleaner in this session."""
+    return _clean_key(file_path, cleaner_label) in getattr(app, "cleaned_log", set())
+
+
+def warn_already_cleaned(cleaner_label):
+    """Logs the duplicate-clean warning and mirrors it in the banner."""
+    log_message(f"Warning: already cleaned this file with {cleaner_label}")
+    set_banner(f"Already cleaned this file with {cleaner_label}", WARNING_COLOR)
+
+
 def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_color):
     """Runs a cleaner ((module_name, function_name)) in a worker process with live updates and real cancellation."""
     global start_time, dot_count, _banner_secs
@@ -1015,6 +1031,10 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
 
     if not getattr(app, 'selected_path', None):
         log_message("Warning: Please upload a retail file before running the cleaner.")
+        return
+
+    if already_cleaned(app.selected_path, base_text):
+        warn_already_cleaned(base_text)
         return
 
     file_name = Path(app.selected_path).name
@@ -1103,6 +1123,8 @@ def update_stats(rows, elapsed):
 def handle_success(row_count, output_path, elapsed_seconds, button, base_text, default_color, hover_color):
     _finish_common()
     app.run_done = True
+    if getattr(app, "selected_path", None):
+        app.cleaned_log.add(_clean_key(app.selected_path, base_text))
     duration_str = format_duration(elapsed_seconds)
 
     set_progress("success")
@@ -1327,6 +1349,9 @@ def start_cleaner(c):
     if not getattr(app, "selected_path", None):
         log_message("Warning: Please upload a retail file before running the cleaner.")
         return
+    if already_cleaned(app.selected_path, c["label"]):
+        warn_already_cleaned(c["label"])
+        return
     if not app.skip_confirm:
         name = Path(app.selected_path).name
         if not custom_askyesno("Confirm Action", f"Run the {c['label']} on “{name}”?"):
@@ -1445,6 +1470,7 @@ if __name__ == "__main__":
     app.run_done = False
     app.skip_confirm = False
     app.stats = {"files": 0, "rows": 0}
+    app.cleaned_log = set()  # (file name, cleaner label) pairs that already finished successfully this session
     CONFIG = load_config()
 
     # Grid: row0 header | row1 controls (+ log in two-pane mode) | row2 log (single column) | row3 footer

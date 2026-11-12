@@ -544,6 +544,61 @@ def remove_customer_sale_return_pairs(df: pd.DataFrame, audit_log: list, price_c
 
 
 # =========================================================
+# INTEREST AUDIT (read-only)
+# Records what the interest step did so it can be checked in the "Removal Audit Log" sheet.
+# Nothing here changes the data or the interest calculation.
+# =========================================================
+
+def _receipt_key(frame: pd.DataFrame) -> pd.Series:
+    """One text key per receipt + customer (same grouping the interest step uses)."""
+    return frame["RECEIPT_NO"].astype(str) + "||" + frame["CUSTOMER_NAME"].fillna("").astype(str)
+
+
+def _sale_sums_by_receipt(frame: pd.DataFrame, price_col: str) -> pd.Series:
+    """Total sale amount per receipt + customer. Called before and after the interest step."""
+    amounts = pd.to_numeric(frame[price_col], errors="coerce").fillna(0)
+    return amounts.groupby(_receipt_key(frame).to_numpy()).sum()
+
+
+def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
+                         applied_reason, unapplied_reason, applied_mask=None):
+    """
+    One audit row per interest line, with:
+      INTEREST_AMOUNT          this line's interest amount
+      RECEIPT_INTEREST_TOTAL   all interest on the receipt + customer      (first line of each receipt only)
+      INTEREST_ADDED_TO_SALES  how much the sale lines actually went up    (first line of each receipt only)
+      INTEREST_VARIANCE        total minus added; should be 0.00           (first line of each receipt only)
+      INTEREST_CHECK           OK / MISMATCH / NOT APPLIED                 (every line)
+    Receipt-level figures are filled once per receipt so the columns can be summed without double counting.
+    """
+    audit = interest_rows.copy()
+    key = _receipt_key(audit)
+    amount = pd.to_numeric(audit[price_col], errors="coerce").fillna(0)
+
+    receipt_total = key.map(amount.groupby(key.to_numpy()).sum()).astype(float)
+    added = key.map(sums_after.sub(sums_before, fill_value=0)).astype(float).fillna(0)
+    variance = receipt_total - added
+
+    if applied_mask is None:
+        applied = key.isin(sums_before.index).to_numpy()
+    else:
+        applied = np.asarray(applied_mask, dtype=bool)
+    off_total = variance.abs().to_numpy() > 0.005
+    first = ~key.duplicated().to_numpy()
+
+    audit["REMOVAL_REASON"] = np.where(applied, applied_reason, unapplied_reason)
+    audit["INTEREST_AMOUNT"] = amount.round(2).to_numpy()
+    for col, vals in (("RECEIPT_INTEREST_TOTAL", receipt_total),
+                      ("INTEREST_ADDED_TO_SALES", added),
+                      ("INTEREST_VARIANCE", variance)):
+        audit[col] = np.where(first, vals.round(2).to_numpy(), np.nan)
+    audit["INTEREST_CHECK"] = np.where(~applied, "NOT APPLIED", np.where(off_total, "MISMATCH", "OK"))
+    return audit
+
+
+
+
+# =========================================================
 # MAIN PROCESSOR
 # =========================================================
 
@@ -644,6 +699,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
         interest = df[interest_mask]
         main = df[~interest_mask].copy()
+        interest_sales_before = _sale_sums_by_receipt(main, "EXT_PRICE_W_TAX")  # audit only
 
         totals = interest.groupby(keys)["EXT_PRICE_W_TAX"].sum()
         amounts = main["EXT_PRICE_W_TAX"].fillna(0)
@@ -657,6 +713,12 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
         is_matched = interest.set_index(keys).index.isin(matched)
         df = pd.concat([main, interest[~is_matched]], ignore_index=True)
+        audit_log.append(build_interest_audit(
+            interest, interest_sales_before, _sale_sums_by_receipt(main, "EXT_PRICE_W_TAX"), "EXT_PRICE_W_TAX",
+            applied_reason="Interest Line - Added To Largest Sale Line On Receipt",
+            unapplied_reason="Interest Line - NOT ADDED (no sale line on receipt; kept as its own row)",
+            applied_mask=is_matched,
+        ))
 
     df = remove_customer_sale_return_pairs(df, audit_log, "EXT_PRICE_W_TAX")
 
