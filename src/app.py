@@ -129,7 +129,7 @@ LOG_MIN_HEIGHT = 96
 LOG_MIN_HEIGHT_COMPACT = 84
 LOG_ROW_MIN = 70              # the log row never collapses below this in single-column mode
 SCREEN_RESERVE_PX = 100       # taskbar + window title bar, in real pixels
-APP_VERSION = "v3.9.22"
+APP_VERSION = "v3.10.22"
 CURRENT_YEAR = datetime.datetime.now().year
 BASE_TITLE = "Strat Data Cleaner"
 CONFIG_PATH = Path.home() / ".strat_data_cleaner.json"
@@ -1107,7 +1107,7 @@ def handle_success(row_count, output_path, elapsed_seconds, button, base_text, d
 
     set_progress("success")
     set_banner(f"Completed — {int(row_count):,} rows cleaned in {duration_str}", SUCCESS_COLOR)
-    set_title("Completed ✓")
+    set_title("Completed")
     update_stats(row_count, elapsed_seconds)
 
     app.last_output_path = output_path
@@ -1336,6 +1336,72 @@ def start_cleaner(c):
 
 
 # ======================================================================
+# Loading splash: one small window that covers the build of the real UI
+# ======================================================================
+class LoadingSplash(tk.Toplevel):
+    """
+    Borderless loading window. The real window is built invisibly behind it (alpha 0) and then swapped
+    in fully laid out, so the user never watches the components appear one by one.
+    """
+    W, H = 400, 180  # unscaled units
+
+    def __init__(self, master):
+        super().__init__(master)
+        self.withdraw()
+        self.overrideredirect(True)
+        self.configure(bg=BORDER_COLOR)  # shows through the 1 px canvas padding as a border
+        try:
+            self.attributes("-topmost", True)
+        except Exception:
+            pass
+
+        def s(value):
+            return px(value, master)
+
+        w, h = s(self.W), s(self.H)
+        x = (self.winfo_screenwidth() - w) // 2
+        y = (self.winfo_screenheight() - h) // 2 - s(20)
+        self.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+
+        cw = w - 2
+        self._canvas = tk.Canvas(self, bg=NAVY_BLUE, highlightthickness=0, bd=0)
+        self._canvas.pack(fill="both", expand=True, padx=1, pady=1)
+        c = self._canvas
+
+        c.create_rectangle(0, 0, cw, s(3), fill=ACCENT_ORANGE, outline="")
+        c.create_text(cw / 2, s(58), text=BASE_TITLE, fill=WHITE, font=("Segoe UI", -s(24), "bold"))
+        c.create_text(cw / 2, s(88), text="RETAIL STRATEGY DIVISION  /  DATA ANALYTICS", fill=SECTION_TEXT,
+                      font=("Segoe UI", -s(10), "bold"))
+        self._status = c.create_text(cw / 2, s(124), text="Starting…", fill=MUTED_TEXT, font=("Segoe UI", -s(12)))
+
+        self._x0, self._x1 = s(40), cw - s(40)
+        self._y0, self._y1 = s(146), s(146) + max(s(4), 3)
+        c.create_rectangle(self._x0, self._y0, self._x1, self._y1, fill=SURFACE_BG, outline="")
+        self._fill = c.create_rectangle(self._x0, self._y0, self._x0, self._y1, fill=ACCENT_ORANGE, outline="")
+        c.create_text(cw / 2, s(166), text=APP_VERSION, fill=MUTED_TEXT, font=("Segoe UI", -s(9)))
+
+        self.deiconify()
+        self.lift()
+        self.update()  # first paint; safe here because nothing else has been built yet
+
+    def step(self, text, fraction):
+        """Advance the bar. update_idletasks() only repaints, so no half-built UI callbacks fire."""
+        try:
+            self._canvas.itemconfigure(self._status, text=text)
+            self._canvas.coords(self._fill, self._x0, self._y0,
+                                self._x0 + (self._x1 - self._x0) * max(0.0, min(1.0, fraction)), self._y1)
+            self.update_idletasks()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+
+# ======================================================================
 # Main App Initialization
 # ======================================================================
 FILE_PLACEHOLDER = "Click here to choose an Excel or CSV file  (Ctrl+O)"
@@ -1344,6 +1410,22 @@ if __name__ == "__main__":
     multiprocessing.freeze_support()
 
     app = ctk.CTk()
+
+    # Keep the real window invisible while the UI is built. It stays fully "alive" (mapped, measurable),
+    # so every size/DPI calculation below behaves exactly as before; only the pixels are hidden.
+    try:
+        app.attributes("-alpha", 0.0)
+    except Exception:
+        pass
+    try:
+        splash = LoadingSplash(app)
+    except Exception:
+        splash = None
+
+    def _splash_step(text, fraction):
+        if splash is not None:
+            splash.step(text, fraction)
+
     app.title(BASE_TITLE)
 
     icon_path = resource_path(os.path.join("assets", "strat_data_cleaner.ico"))
@@ -1369,6 +1451,7 @@ if __name__ == "__main__":
     main_frame = ctk.CTkFrame(app, fg_color=NAVY_BLUE, corner_radius=0)
     main_frame.pack(fill="both", expand=True, padx=MAIN_PADX, pady=MAIN_PADY)
 
+    _splash_step("Building header…", 0.12)
     # --- Header (retail gradient banner with price-tag mark) ---
     header_banner = HeaderBanner(
         main_frame, "Strat Data Cleaner", "RETAIL STRATEGY DIVISION  /  DATA ANALYTICS",
@@ -1395,6 +1478,7 @@ if __name__ == "__main__":
         hint.grid(row=0, column=2, sticky="e")
         return row, badge, label, hint
 
+    _splash_step("Building controls…", 0.30)
     # Step 1 - select file
     step1_row, step1_badge, step1_title, _ = make_step_row(left_col, 1, "SELECT RETAIL FILE")
     step1_row.pack(fill="x", pady=(0, 6))
@@ -1434,6 +1518,7 @@ if __name__ == "__main__":
         "height": 48,
         "bg": NAVY_BLUE,
     }
+    _splash_step("Rendering buttons…", 0.50)
     cadence_btn = GradientButton(btn_frame, text="Cadence Cleaner", fg_color=CADENCE_COLOR, hover_color=CADENCE_HOVER,
                                  border_color=CADENCE_ACCENT, state="disabled", **button_style)
     database_btn = GradientButton(btn_frame, text="Database Cleaner", fg_color=DB_COLOR, hover_color=DB_HOVER,
@@ -1519,6 +1604,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     # Activity log column
     # ------------------------------------------------------------------
+    _splash_step("Building activity log…", 0.72)
     log_col.grid_columnconfigure(0, weight=1)
     log_col.grid_rowconfigure(1, weight=1)
 
@@ -1566,6 +1652,7 @@ if __name__ == "__main__":
     # ======================================================================
     # Responsive layout engine
     # ======================================================================
+    _splash_step("Fitting to your screen…", 0.88)
     _layout = {"mode": None, "cols": None, "stacked_footer": None, "wrap": {}, "compact": False,
                "main_pady": MAIN_PADY, "auto_compact": True, "dual_w": None,
                "scale": None, "settle_until": 0.0, "scale_job": None}
@@ -1875,6 +1962,17 @@ if __name__ == "__main__":
     # ======================================================================
     # Start
     # ======================================================================
+    def _reveal_app():
+        """One-step handover: the finished, fully laid-out window appears and the splash goes away."""
+        try:
+            app.attributes("-alpha", 1.0)
+            app.lift()
+        except Exception:
+            pass
+        if splash is not None:
+            splash.close()
+
+    _splash_step("Finishing up…", 0.97)
     refresh_steps()
     set_progress("idle")
     try:
@@ -1884,6 +1982,19 @@ if __name__ == "__main__":
     _layout["scale"] = widget_scale(app)
     _layout["scale_job"] = app.after(120, _check_scale)
     schedule_layout()
+
+    # Settle everything while the window is still invisible: realise the final geometry, run the
+    # responsive layout pass and the clipping check now (instead of 40 ms / 350 ms after it is on screen),
+    # then reveal. This is what removes the visible re-flow.
+    try:
+        app.update()
+        apply_layout()
+        verify_fit()
+        app.update_idletasks()
+    except Exception:
+        pass
+    _splash_step("Ready", 1.0)
+    _reveal_app()
 
     # Optional diagnostics: set STRAT_PERF_LOG=1 to log every moment the UI loop was blocked for 80 ms or more.
     if os.environ.get("STRAT_PERF_LOG"):
