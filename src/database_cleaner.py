@@ -602,9 +602,37 @@ def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
 # MAIN PROCESSOR
 # =========================================================
 
-def process_database(input_file_path: str) -> tuple[int, str]:
+def _build_run_stats(rows_in, rows_out, audit_df, unmapped_stores, accessory_rows_merged):
+    """Small summary dict returned to the app so it can show what the run actually did."""
+    removed, pairs, interest_unapplied, interest_mismatch = [], 0, 0, 0
+    if audit_df is not None and "REMOVAL_REASON" in audit_df.columns:
+        reasons = audit_df["REMOVAL_REASON"].fillna("").astype(str)
+        is_pair = reasons.str.startswith("Customer-Level Matched")
+        if is_pair.any():
+            removed.append(("Matched sale/return rows", int(is_pair.sum())))
+            if "PAIR_ID" in audit_df.columns:
+                pairs = int(audit_df.loc[is_pair, "PAIR_ID"].nunique())
+        for reason, count in reasons[~is_pair].value_counts().items():
+            if reason:
+                removed.append((str(reason), int(count)))
+        if "INTEREST_CHECK" in audit_df.columns:
+            check = audit_df["INTEREST_CHECK"].fillna("").astype(str)
+            interest_unapplied = int((check == "NOT APPLIED").sum())
+            interest_mismatch = int((check == "MISMATCH").sum())
+    if accessory_rows_merged > 0:
+        removed.append(("Accessory lines rolled into main item", int(accessory_rows_merged)))
+    return {
+        "rows_in": int(rows_in), "rows_out": int(rows_out), "removed": removed, "pairs": pairs,
+        "unmapped_stores": list(unmapped_stores),
+        "interest_unapplied": interest_unapplied, "interest_mismatch": interest_mismatch,
+    }
+
+
+def process_database(input_file_path: str, progress=None) -> tuple[int, str, dict]:
     input_path = Path(input_file_path)
     audit_log = []
+    say = progress or (lambda _msg: None)   # stage messages shown live in the app
+    say("Reading file…")
 
     if input_path.suffix.lower() in [".xls", ".xlsx"]:
         frames = pd.read_excel(input_path, sheet_name=None, header=None, dtype=object, engine="openpyxl", keep_default_na=False, na_values=[""])
@@ -615,6 +643,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         padded = [r + [""] * (width - len(r)) for r in rows]
         frames = {"csv": pd.DataFrame(padded, dtype=object)}
 
+    say("Detecting header and columns…")
     prepared = [prepare_sheet(raw, sname) for sname, raw in frames.items()]
     prepared = [p for p in prepared if p is not None]
     if not prepared:
@@ -626,6 +655,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     for col in data_cols:
         df[col] = df[col].map(clean_cell)
     df = df.dropna(how="all", subset=data_cols).reset_index(drop=True)
+    rows_in = len(df)
 
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
@@ -640,15 +670,18 @@ def process_database(input_file_path: str) -> tuple[int, str]:
             stripped = df[col].map(lambda v: v.replace(",", "").strip() if isinstance(v, str) else v)
             df[col] = pd.to_numeric(stripped, errors="coerce").fillna(0)
 
+    say("Standardizing customers and brands…")
     df = fuzzy_normalize_customers(df, "CUSTOMER_NAME")
     df = clean_special_brands(df, audit_log)
 
+    say("Mapping store names…")
     lookup = {normalize_store_key(k): v for k, v in STORE_NAME_MAP.items()}
     standard = {normalize_store_key(v): v for v in STORE_NAME_MAP.values()}
     original_stores = df["STORE_NAME"]
     keys = original_stores.map(lambda v: normalize_store_key(v) if isinstance(v, str) else None)
     mapped = keys.map(lookup).where(lambda s: s.notna(), keys.map(standard))
     df["STORE_NAME"] = mapped.where(mapped.notna(), original_stores)
+    unmapped_stores = sorted({str(v).strip() for v in original_stores[mapped.isna() & original_stores.notna()]})
 
     def channel_of(name: Any) -> Optional[str]:
         if not isinstance(name, str):
@@ -658,6 +691,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     df.insert(0, "CHANNEL", df["STORE_NAME"].map(channel_of))
 
+    say("Parsing dates…")
     df["RCPT_DATE"] = pd.to_datetime([parse_date_value(v) for v in df["RCPT_DATE"]], errors="coerce")
     
     dates = df["RCPT_DATE"]
@@ -687,6 +721,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
 
     df = clean_special_brands(df, audit_log)
 
+    say("Applying interest lines…")
     interest_mask = (
         df["BRAND"].str.contains("INTEREST", case=False, na=False) |
         df["LONG_DESCRIPTION"].str.contains("INTEREST", case=False, na=False) |
@@ -720,11 +755,15 @@ def process_database(input_file_path: str) -> tuple[int, str]:
             applied_mask=is_matched,
         ))
 
+    say("Matching sale/return pairs…")
     df = remove_customer_sale_return_pairs(df, audit_log, "EXT_PRICE_W_TAX")
 
     # Accessories are rolled up AFTER pairing, so split baskets are still matchable line by line
     # and leftover (genuine) returns are not swallowed into a sale.
+    say("Rolling up accessories…")
+    rows_before_rollup = len(df)
     df = roll_up_accessories(df, "EXT_PRICE_W_TAX")
+    accessory_rows_merged = rows_before_rollup - len(df)
 
     zero_price_mask = df["EXT_PRICE_W_TAX"] == 0
     if zero_price_mask.any():
@@ -733,6 +772,8 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         audit_log.append(zero_df)
         df = df[~zero_price_mask].copy()
 
+    say("Writing Excel file…")
+    audit_df = None
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     yesterday_date = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     base_filename = f"cleaned_database_{yesterday_date}"
@@ -757,6 +798,7 @@ def process_database(input_file_path: str) -> tuple[int, str]:
         else:
             pd.DataFrame(columns=["REMOVAL_REASON", "NOTE"]).to_excel(writer, sheet_name="Removal Audit Log", index=False)
 
+    say("Formatting workbook…")
     wb = openpyxl.load_workbook(output_file)
     ws_main = wb["Cleaned Database Data"]
     table_range = f"A1:{get_column_letter(ws_main.max_column)}{ws_main.max_row}"
@@ -773,4 +815,5 @@ def process_database(input_file_path: str) -> tuple[int, str]:
     format_date_columns(ws_main)
     format_date_columns(ws_audit)
     wb.save(output_file)
-    return len(df), str(output_file)
+    stats = _build_run_stats(rows_in, len(df), audit_df, unmapped_stores, accessory_rows_merged)
+    return len(df), str(output_file), stats

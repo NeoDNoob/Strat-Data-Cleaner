@@ -1,6 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import datetime
+import os
 import openpyxl
 import numpy as np
 import re
@@ -14,7 +15,8 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 # =========================================================
 
 BASE_FOLDER = Path(__file__).resolve().parent.parent
-OUTPUT_DIR = Path.home() / "Desktop" / "Cleaned Data"
+# The app can point this elsewhere through the STRAT_OUTPUT_DIR environment variable.
+OUTPUT_DIR = Path(os.environ.get("STRAT_OUTPUT_DIR") or (Path.home() / "Desktop" / "Cleaned Data"))
 
 # --- Sale/return pair offsetting ---
 PAIR_MAX_SPLIT_LINES = 4        # max lines on the split side (e.g. main + accessory + freebie + 1)
@@ -632,12 +634,40 @@ def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
 # MAIN PROCESSING FUNCTION
 # =========================================================
 
-def process_cadence(input_file_path):
+def _build_run_stats(rows_in, rows_out, audit_df, unmapped_stores, accessory_rows_merged):
+    """Small summary dict returned to the app so it can show what the run actually did."""
+    removed, pairs, interest_unapplied, interest_mismatch = [], 0, 0, 0
+    if audit_df is not None and "REMOVAL_REASON" in audit_df.columns:
+        reasons = audit_df["REMOVAL_REASON"].fillna("").astype(str)
+        is_pair = reasons.str.startswith("Customer-Level Matched")
+        if is_pair.any():
+            removed.append(("Matched sale/return rows", int(is_pair.sum())))
+            if "PAIR_ID" in audit_df.columns:
+                pairs = int(audit_df.loc[is_pair, "PAIR_ID"].nunique())
+        for reason, count in reasons[~is_pair].value_counts().items():
+            if reason:
+                removed.append((str(reason), int(count)))
+        if "INTEREST_CHECK" in audit_df.columns:
+            check = audit_df["INTEREST_CHECK"].fillna("").astype(str)
+            interest_unapplied = int((check == "NOT APPLIED").sum())
+            interest_mismatch = int((check == "MISMATCH").sum())
+    if accessory_rows_merged > 0:
+        removed.append(("Accessory lines rolled into main item", int(accessory_rows_merged)))
+    return {
+        "rows_in": int(rows_in), "rows_out": int(rows_out), "removed": removed, "pairs": pairs,
+        "unmapped_stores": list(unmapped_stores),
+        "interest_unapplied": interest_unapplied, "interest_mismatch": interest_mismatch,
+    }
+
+
+def process_cadence(input_file_path, progress=None):
     input_path = Path(input_file_path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found:\n{input_path}")
 
     audit_log = []
+    say = progress or (lambda _msg: None)   # stage messages shown live in the app
+    say("Finding header row…")
 
     preview = read_data_file(input_path, header=None, nrows=100)
     required = set(REQUIRED_COLUMNS)
@@ -652,6 +682,7 @@ def process_cadence(input_file_path):
     if header_row is None:
         raise ValueError(f"Could not find all required columns in the first 100 rows:\n{REQUIRED_COLUMNS}")
 
+    say("Reading file…")
     df = read_data_file(input_path, header=header_row)
     df.columns = df.columns.astype(str).str.strip().str.upper().str.replace(r"\s+", " ", regex=True)
     df = df.loc[:, ~df.columns.str.contains('UNNAMED', case=False)]
@@ -659,6 +690,7 @@ def process_cadence(input_file_path):
     missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
     if missing:
         raise KeyError(f"Missing required column(s): {missing}")
+    rows_in = len(df)
 
     # Convert to numeric early
     df["EXT_PRICE_W_TAX"] = pd.to_numeric(
@@ -676,10 +708,12 @@ def process_cadence(input_file_path):
     if "RCPT_DATE" in df.columns:
         df["RCPT_DATE"] = pd.to_datetime([parse_date_value(v) for v in df["RCPT_DATE"]], errors="coerce")
 
+    say("Standardizing customers and brands…")
     # Run preprocessing steps
     df = fuzzy_normalize_customers(df, "CUSTOMER_NAME")
     df = clean_special_brands(df, audit_log)
 
+    say("Applying interest lines…")
     long_desc_clean = clean_text(df["LONG_DESCRIPTION"]) if "LONG_DESCRIPTION" in df.columns else pd.Series("", index=df.index)
     interest_mask = df["BRAND"].eq("INTEREST") | long_desc_clean.str.contains("INTEREST", case=False, na=False)
 
@@ -712,11 +746,16 @@ def process_cadence(input_file_path):
         audit_log.append(zero_df)
         df = df[~zero_price_mask].copy().reset_index(drop=True)
 
+    say("Matching sale/return pairs…")
     df = remove_customer_sale_return_pairs(df, audit_log, "EXT_PRICE_W_TAX")
 
     # Accessories are rolled up AFTER pairing so split baskets stay matchable line by line,
     # and leftover (genuine) returns are not swallowed into a sale.
+    say("Rolling up accessories…")
+    rows_before_rollup = len(df)
     df = roll_up_accessories(df, "EXT_PRICE_W_TAX")
+    accessory_rows_merged = rows_before_rollup - len(df)
+    say("Assigning channel, brand and tags…")
     df["STORE_NAME"] = fix_store_typos_vectorized(clean_text(df["STORE_NAME"]))
     df["BRAND"] = clean_text(df["BRAND"])
 
@@ -732,6 +771,8 @@ def process_cadence(input_file_path):
     tail = ["CATEGORY", "CHANNEL", "PRODUCT_TAG"]
     df = df[[c for c in df.columns if c not in tail] + tail]
 
+    say("Writing Excel file…")
+    audit_df = None
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     yesterday_date = (datetime.date.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     base_filename = f"cleaned_cadence_{yesterday_date}"
@@ -756,6 +797,7 @@ def process_cadence(input_file_path):
         else:
             pd.DataFrame(columns=["REMOVAL_REASON", "NOTE"]).to_excel(writer, sheet_name="Removal Audit Log", index=False)
 
+    say("Formatting workbook…")
     wb = openpyxl.load_workbook(output_file)
     ws_main = wb["Cleaned Cadence Data"]
     table_range = f"A1:{openpyxl.utils.get_column_letter(ws_main.max_column)}{ws_main.max_row}"
@@ -772,4 +814,5 @@ def process_cadence(input_file_path):
     format_date_columns(ws_main)
     format_date_columns(ws_audit)
     wb.save(output_file)
-    return len(df), str(output_file)
+    stats = _build_run_stats(rows_in, len(df), audit_df, [], accessory_rows_merged)
+    return len(df), str(output_file), stats
