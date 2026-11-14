@@ -2,6 +2,7 @@ import threading
 import json
 import multiprocessing
 import importlib
+import inspect
 import queue as _queue
 from collections import OrderedDict
 from typing import TYPE_CHECKING
@@ -16,11 +17,18 @@ from pathlib import Path
 import sys
 import time
 import traceback
+import subprocess
+import re
 
 from PIL import Image, ImageDraw, ImageTk
 
+try:
+    import winsound  # Windows only: system sounds for the completion alert
+except ImportError:
+    winsound = None
+
 if TYPE_CHECKING:  # never runs; lets PyInstaller discover the cleaner modules that the worker imports by name
-    import cadence_cleaner, database_cleaner, brand_performance_cleaner, existing_db_cleaner  # noqa: F401
+    import cadence_cleaner, brand_performance_cleaner, existing_db_cleaner, current_sales_cleaner, database_cleaner  # noqa: F401
 
 # --- Fix Taskbar Icon Grouping on Windows ---
 try:
@@ -78,6 +86,9 @@ BRAND_ACCENT = "#A78BFA"
 EXISTING_DB_COLOR = "#3B2B24"
 EXISTING_DB_HOVER = "#52392D"
 EXISTING_DB_ACCENT = "#F59E0B"
+CURRENT_SALES_COLOR = "#3A2030"
+CURRENT_SALES_HOVER = "#4F2B42"
+CURRENT_SALES_ACCENT = "#F472B6"
 
 CANCEL_COLOR = "#7F1D1D"
 CANCEL_HOVER = "#991B1B"
@@ -87,7 +98,7 @@ OPEN_BTN_HOVER = "#14958A"
 OPEN_BTN_GRADIENT_END = "#0891B2"
 OPEN_BTN_DISABLED = "#16213A"
 DISABLED_BORDER = "#1F2D47"
-DISABLED_TEXT = "#64748B"
+DISABLED_TEXT = "#8091AD"
 
 MUTED_TEXT = "#94A3B8"
 LOG_BG = "#060C18"
@@ -108,7 +119,7 @@ FILE_LOADED_BORDER = "#1F7A5C"
 
 # Step badges (1 Select -> 2 Choose -> 3 Review)
 STEP_TODO_BG = "#1B2740"
-STEP_TODO_TEXT = "#64748B"
+STEP_TODO_TEXT = "#8091AD"
 STEP_ACTIVE_BG = "#2563EB"
 STEP_DONE_BG = "#0F5F49"
 STEP_DONE_TITLE = "#8FD9B8"
@@ -128,8 +139,9 @@ MAX_LOG_LINES = 1500
 LOG_MIN_HEIGHT = 96
 LOG_MIN_HEIGHT_COMPACT = 84
 LOG_ROW_MIN = 70              # the log row never collapses below this in single-column mode
-SCREEN_RESERVE_PX = 100       # taskbar + window title bar, in real pixels
-APP_VERSION = "v3.10.22"
+SCREEN_RESERVE_PX = 100       # taskbar + window title bar, in real pixels (fallback when the monitor is unknown)
+TITLEBAR_RESERVE_PX = 56      # title bar + borders, in real pixels (the monitor work area already excludes the taskbar)
+APP_VERSION = "v3.12.22"
 CURRENT_YEAR = datetime.datetime.now().year
 BASE_TITLE = "Strat Data Cleaner"
 CONFIG_PATH = Path.home() / ".strat_data_cleaner.json"
@@ -147,6 +159,34 @@ try:  # imported once (this is called on every redraw and every layout pass)
     from customtkinter.windows.widgets.scaling.scaling_tracker import ScalingTracker as _ScalingTracker
 except Exception:
     _ScalingTracker = None
+
+
+def _monitor_work_height_px():
+    """Usable height (real pixels, taskbar excluded) of the monitor the window is on right now.
+    Tk's winfo_screenheight() only describes the primary monitor, so it is wrong after the window is
+    moved to another one. Returns None when unknown (non-Windows or any failure)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        from ctypes import wintypes
+
+        class _MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        user32 = ctypes.windll.user32
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+        hwnd = user32.GetParent(app.winfo_id()) or app.winfo_id()
+        handle = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        if handle and user32.GetMonitorInfoW(handle, ctypes.byref(info)):
+            return int(info.rcWork.bottom - info.rcWork.top)
+    except Exception:
+        pass
+    return None
 
 
 def widget_scale(widget):
@@ -502,8 +542,37 @@ def _tag_icon(size):
     return photo
 
 
+_LOGO_SRC = None  # decoded app logo (PIL image); False once loading has failed so we only try once
+
+
+def _logo_icon(size):
+    """The app logo (assets/strat_data_cleaner.ico) scaled to `size` px, cached.
+    Falls back to the price-tag glyph if the file is missing or unreadable."""
+    global _LOGO_SRC
+    key = ("logo", size)
+    cached = _IMG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if _LOGO_SRC is None:
+        try:
+            ico = Image.open(resource_path(os.path.join("assets", "strat_data_cleaner.ico")))
+            try:  # .ico files hold several sizes: start from the largest for the sharpest downscale
+                best = max(ico.ico.sizes())
+                ico.size = best
+            except Exception:
+                pass
+            _LOGO_SRC = ico.convert("RGBA")
+        except Exception:
+            _LOGO_SRC = False
+    if not _LOGO_SRC:
+        return _tag_icon(size)
+    photo = ImageTk.PhotoImage(_LOGO_SRC.resize((size, size), Image.LANCZOS))
+    _IMG_CACHE[key] = photo
+    return photo
+
+
 class HeaderBanner(tk.Canvas):
-    """Retail gradient banner with a price-tag mark. Title and subtitle sit side by side, or stack when space is tight."""
+    """Retail gradient banner with the app logo on the left. Title and subtitle sit side by side, or stack when space is tight."""
 
     def __init__(self, master, title, subtitle, stops, bg=NAVY_BLUE, on_height_change=None):
         scale = widget_scale(master)
@@ -566,7 +635,7 @@ class HeaderBanner(tk.Canvas):
         s = widget_scale(self)
         (title_font, sub_font), fonts_changed = self._fonts_for(s)
         gap = int(round(22 * s))
-        icon_px = int(round(30 * s))
+        icon_px = int(round(40 * s))
         text_x = gap + icon_px + int(round(12 * s))
         side_by_side = (text_x + title_font.measure(self._hb_title)
                         + sub_font.measure(self._hb_subtitle) + gap * 2) <= w
@@ -579,7 +648,7 @@ class HeaderBanner(tk.Canvas):
         photo = render_gradient(w, h, self._hb_stops, int(round(14 * s)), self._hb_bg,
                                 HEADER_BORDER, max(1, int(round(s))), 0.08)
         self._hb_photo = photo
-        icon = _tag_icon(icon_px)
+        icon = _logo_icon(icon_px)
         self._hb_icon = icon  # keep a reference: the LRU cache may evict it, and Tk would then drop the image
 
         if side_by_side:
@@ -750,9 +819,71 @@ def save_config(cfg):
 
 
 # ======================================================================
+# Activity-log tools: level filter + warning badge
+# ======================================================================
+LOG_FILTERS = {"All": None, "Warnings": "warning", "Errors": "error"}
+_LOG_LEVELS = ("normal", "success", "warning", "notice", "error", "processing")
+_log_state = {"filter": "All", "warn_idx": -1, "flash_job": None, "badge_shown": False}
+
+
+def _apply_log_filter(mode=None):
+    """Shows only the chosen level of log lines (the full log is kept, and Copy/Save still export all of it)."""
+    if mode is not None:
+        _log_state["filter"] = mode
+    keep = LOG_FILTERS.get(_log_state["filter"])
+    tb = status_box._textbox
+    for level in _LOG_LEVELS:
+        tb.tag_configure(level, elide=(keep is not None and level != keep))
+    tb.see("end")
+
+
+def _refresh_warn_badge():
+    """Keeps the 'N warnings' badge in step with the warning lines currently in the log."""
+    try:
+        count = len(status_box._textbox.tag_ranges("warnline")) // 2
+        if count:
+            warn_badge.configure(text=f"⚠ {count} warning{'s' if count != 1 else ''}")
+            if not _log_state["badge_shown"]:
+                warn_badge.pack(side="left", padx=(8, 0))
+                _log_state["badge_shown"] = True
+        else:
+            if _log_state["badge_shown"]:
+                warn_badge.pack_forget()
+                _log_state["badge_shown"] = False
+            _log_state["warn_idx"] = -1
+    except Exception:
+        pass
+
+
+def jump_to_warning(_event=None):
+    """Scrolls to the newest warning, then to the next older one on every further click."""
+    try:
+        tb = status_box._textbox
+        ranges = tb.tag_ranges("warnline")
+        count = len(ranges) // 2
+        if not count:
+            return
+        if _log_state["filter"] == "Errors":  # warnings are hidden under the Errors filter
+            log_filter.set("All")
+            _apply_log_filter("All")
+        idx = _log_state["warn_idx"]
+        idx = count - 1 if idx < 0 or idx >= count else (idx - 1) % count
+        _log_state["warn_idx"] = idx
+        start = str(ranges[2 * idx])
+        tb.see(start)
+        tb.tag_remove("flash", "1.0", "end")
+        tb.tag_add("flash", start, f"{start} lineend +1c")
+        if _log_state["flash_job"] is not None:
+            app.after_cancel(_log_state["flash_job"])
+        _log_state["flash_job"] = app.after(1400, lambda: tb.tag_remove("flash", "1.0", "end"))
+    except Exception:
+        pass
+
+
+# ======================================================================
 # Logging, status banner, window title, progress
 # ======================================================================
-def log_message(message):
+def log_message(message, level=None):
     """Inserts a timestamped color-coded message into the inline status box safely."""
     global status_box
     try:
@@ -770,8 +901,15 @@ def log_message(message):
             elif any(w in message for w in ["Processing", "Consolidating", "Running"]):
                 tag = "processing"
 
+            if level in _LOG_LEVELS:  # the caller knows best (e.g. every line of a traceback is an error)
+                tag = level
+
+            if tag == "warning" and "Warning" not in message:
+                tag = "notice"  # same orange, but not counted as a warning (e.g. "log cleared", "cancelled")
+
             tb = status_box._textbox
-            tb.insert("end", f"[{timestamp}] {message}\n", tag)
+            tags = (tag, "warnline") if tag == "warning" else (tag,)
+            tb.insert("end", f"[{timestamp}] {message}\n", tags)
 
             # Keep the log bounded so long sessions never slow the UI down.
             extra = int(tb.index("end-1c").split(".")[0]) - MAX_LOG_LINES
@@ -780,6 +918,7 @@ def log_message(message):
 
             status_box.see("end")
             status_box.configure(state="disabled")
+            _refresh_warn_badge()
             return
     except Exception:
         pass
@@ -861,6 +1000,15 @@ timer_job = None
 dot_count = 0
 start_time = 0
 _banner_secs = -1
+_stage_text = ""
+
+
+def set_stage(text):
+    """Shows the cleaner's current stage in the banner and the activity log."""
+    global _stage_text, _banner_secs
+    _stage_text = text
+    _banner_secs = -1  # refresh the banner on the next spinner frame
+    log_message(f"Running: {text}")
 
 
 def animate_process_state(button, base_text):
@@ -878,7 +1026,8 @@ def animate_process_state(button, base_text):
             _banner_secs = elapsed
             m, s = divmod(elapsed, 60)
             time_str = f"{m} min {s} sec" if m > 0 else f"{s} sec"
-            set_banner(f"Running {base_text}  ·  {time_str}", INFO_COLOR)
+            stage = f"  ·  {_stage_text}" if _stage_text else ""
+            set_banner(f"Running {base_text}{stage}  ·  {time_str}", INFO_COLOR)
 
         dot_count += 1
         animation_job = app.after(SPINNER_INTERVAL_MS, lambda: animate_process_state(button, base_text))
@@ -917,8 +1066,15 @@ def _worker_entry(module_name, func_name, file_path, result_q):
             sys.stderr = open(os.devnull, "w")
         _lower_priority()
         cleaner_func = getattr(importlib.import_module(module_name), func_name)
-        row_count, output_path = cleaner_func(file_path)
-        result_q.put(("ok", row_count, output_path))
+        kwargs = {}
+        try:  # cleaners that accept `progress` stream stage messages; older ones simply run as before
+            if "progress" in inspect.signature(cleaner_func).parameters:
+                kwargs["progress"] = lambda text: result_q.put(("progress", str(text)))
+        except (TypeError, ValueError):
+            pass
+        result = cleaner_func(file_path, **kwargs)
+        stats = result[2] if len(result) > 2 else None   # optional run summary
+        result_q.put(("ok", result[0], result[1], stats))
     except BaseException:
         result_q.put(("err", traceback.format_exc()))
 
@@ -955,15 +1111,26 @@ def poll_worker(button, base_text, default_color, hover_color):
         return
 
     msg = None
-    try:
-        msg = q.get_nowait()
-    except _queue.Empty:
-        if not proc.is_alive():
-            try:
-                msg = q.get(timeout=0.3)  # result may have landed just before the process exited
-            except _queue.Empty:
-                msg = ("err", f"The worker process ended unexpectedly (exit code {proc.exitcode}).\n"
-                              "This usually means the file was too large for the available memory.")
+    while msg is None:  # drain stage messages; stop at the final result
+        try:
+            item = q.get_nowait()
+        except _queue.Empty:
+            break
+        if item[0] == "progress":
+            set_stage(item[1])
+        else:
+            msg = item
+    if msg is None and not proc.is_alive():
+        try:
+            while msg is None:  # the result may have landed just before the process exited
+                item = q.get(timeout=0.3)
+                if item[0] == "progress":
+                    set_stage(item[1])
+                else:
+                    msg = item
+        except _queue.Empty:
+            msg = ("err", f"The worker process ended unexpectedly (exit code {proc.exitcode}).\n"
+                          "This usually means the file was too large for the available memory.")
 
     if msg is None:
         _worker["job"] = app.after(120, lambda: poll_worker(button, base_text, default_color, hover_color))
@@ -972,7 +1139,8 @@ def poll_worker(button, base_text, default_color, hover_color):
     elapsed = time.time() - start_time
     _stop_worker()
     if msg[0] == "ok":
-        handle_success(msg[1], msg[2], elapsed, button, base_text, default_color, hover_color)
+        handle_success(msg[1], msg[2], elapsed, button, base_text, default_color, hover_color,
+                       msg[3] if len(msg) > 3 else None)
     else:
         handle_error(msg[1], button, base_text, default_color, hover_color)
 
@@ -1023,9 +1191,9 @@ def warn_already_cleaned(cleaner_label):
     set_banner(f"Already cleaned this file with {cleaner_label}", WARNING_COLOR)
 
 
-def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_color):
+def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_color, force=False):
     """Runs a cleaner ((module_name, function_name)) in a worker process with live updates and real cancellation."""
-    global start_time, dot_count, _banner_secs
+    global start_time, dot_count, _banner_secs, _stage_text
     if getattr(app, 'is_processing', False):
         return
 
@@ -1033,11 +1201,12 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
         log_message("Warning: Please upload a retail file before running the cleaner.")
         return
 
-    if already_cleaned(app.selected_path, base_text):
+    if not force and already_cleaned(app.selected_path, base_text):
         warn_already_cleaned(base_text)
         return
 
     file_name = Path(app.selected_path).name
+    app.current_run = (file_name, base_text)
     log_message(f"Processing file on '{file_name}' using {base_text}...")
 
     app.is_processing = True
@@ -1058,6 +1227,7 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
 
     dot_count = 0
     _banner_secs = -1
+    _stage_text = ""
     animate_process_state(button, base_text)
 
     try:
@@ -1083,6 +1253,9 @@ def cancel_operation():
         set_title(None)
         set_banner("Operation cancelled. Ready for the next task.", WARNING_COLOR)
         refresh_steps()
+        run = getattr(app, "current_run", None)
+        if run:
+            add_history("cancel", run[0], run[1])
 
 
 def request_cancel(_event=None):
@@ -1111,16 +1284,125 @@ def short_duration(seconds):
     return f"{int(seconds // 60)}m {int(seconds % 60):02d}s"
 
 
+def _summary_text():
+    stats = app.stats
+    if not stats["files"]:
+        return "No files cleaned yet"
+    last = f"  ·  last run {short_duration(stats['last'])}" if stats.get("last") is not None else ""
+    return f"{stats['files']:,} file{'s' if stats['files'] != 1 else ''}  ·  {stats['rows']:,} rows{last}"
+
+
 def update_stats(rows, elapsed):
     stats = app.stats
     stats["files"] += 1
     stats["rows"] += int(rows)
-    stat_files.configure(text=f"{stats['files']:,}")
-    stat_rows.configure(text=f"{stats['rows']:,}")
-    stat_last.configure(text=short_duration(elapsed))
+    stats["last"] = elapsed
+    session_summary.configure(text=_summary_text())
 
 
-def handle_success(row_count, output_path, elapsed_seconds, button, base_text, default_color, hover_color):
+# --- Session run history ---
+HISTORY_MAX = 50
+_HIST_ICONS = {"ok": ("✓", "ok"), "warn": ("⚠", "warn"), "err": ("✗", "err"), "cancel": ("■", "cancel")}
+
+
+def _current_file_name():
+    path = getattr(app, "selected_path", None)
+    return Path(path).name if path else "(no file)"
+
+
+def _render_history():
+    t = hist_text
+    t.configure(state="normal")
+    t.delete("1.0", "end")
+    if not app.history:
+        t.insert("end", "No runs yet — finished runs will be listed here.", "muted")
+    else:
+        last = len(app.history) - 1
+        for i, e in enumerate(app.history):
+            icon, tag = _HIST_ICONS[e["status"]]
+            t.insert("end", icon + "  ", tag)
+            parts = [e["time"]]
+            if e["status"] in ("ok", "warn"):
+                parts += [short_duration(e["elapsed"]), f"{e['rows']:,} rows"]
+                if e["warns"]:
+                    parts.append(f"{e['warns']} warning{'s' if e['warns'] != 1 else ''}")
+            elif e["status"] == "err":
+                parts.append("failed")
+            else:
+                parts.append("cancelled")
+            parts += [e["cleaner"], e["file"]]
+            t.insert("end", "  ·  ".join(parts) + ("\n" if i < last else ""), "rest")
+    t.configure(state="disabled")
+    t.yview_moveto(0)
+
+
+def add_history(status, file_name, cleaner, rows=None, elapsed=None, warns=0):
+    """Records one run (newest first) in the session strip."""
+    app.history.insert(0, {"status": status, "file": file_name, "cleaner": cleaner, "rows": rows,
+                           "elapsed": elapsed, "warns": warns,
+                           "time": datetime.datetime.now().strftime("%I:%M %p").lstrip("0")})
+    del app.history[HISTORY_MAX:]
+    _render_history()
+
+
+# --- Completion alert (taskbar flash + system sound) ---
+class _FLASHWINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("hwnd", ctypes.c_void_p), ("dwFlags", ctypes.c_uint),
+                ("uCount", ctypes.c_uint), ("dwTimeout", ctypes.c_uint)]
+
+
+def notify_done(kind, elapsed):
+    """When a run ends while the window is in the background, flash the taskbar button until it is
+    focused and play a system sound. A run you were watching only gets the sound, and only if it was long."""
+    try:
+        away = app.state() == "iconic" or app.focus_displayof() is None
+        if not away and elapsed < 20:
+            return
+        if sys.platform == "win32":
+            if away:
+                user32 = ctypes.windll.user32
+                user32.GetParent.argtypes = [ctypes.c_void_p]
+                user32.GetParent.restype = ctypes.c_void_p
+                info = _FLASHWINFO(ctypes.sizeof(_FLASHWINFO), user32.GetParent(app.winfo_id()),
+                                   0x2 | 0xC, 0, 0)  # FLASHW_TRAY | FLASHW_TIMERNOFG
+                user32.FlashWindowEx(ctypes.byref(info))
+            if winsound is not None:
+                winsound.MessageBeep({"success": winsound.MB_ICONASTERISK,
+                                      "warning": winsound.MB_ICONEXCLAMATION,
+                                      "error": winsound.MB_ICONHAND}.get(kind, winsound.MB_OK))
+        else:
+            app.bell()
+    except Exception:
+        pass
+
+
+def log_run_summary(stats):
+    """Logs what the cleaner did and returns how many warnings it raised."""
+    if not stats:
+        return 0
+    warnings = 0
+    rows_in, rows_out = stats.get("rows_in"), stats.get("rows_out")
+    if rows_in is not None and rows_out is not None:
+        log_message(f"Summary: {rows_in:,} rows in, {rows_out:,} rows out (net {rows_out - rows_in:+,})")
+    for label, count in stats.get("removed", []):
+        log_message(f"   {label}: {count:,} row(s)")
+    if stats.get("pairs"):
+        log_message(f"   Sale/return pairs matched: {stats['pairs']:,}")
+    unmapped = stats.get("unmapped_stores") or []
+    if unmapped:
+        warnings += 1
+        shown = ", ".join(unmapped[:8]) + (f" … (+{len(unmapped) - 8} more)" if len(unmapped) > 8 else "")
+        log_message(f"Warning: {len(unmapped)} store name(s) not in the store map, kept as-is: {shown}")
+    if stats.get("interest_unapplied"):
+        warnings += 1
+        log_message(f"Warning: {stats['interest_unapplied']} interest line(s) had no sale line on their receipt (see the Removal Audit Log)")
+    if stats.get("interest_mismatch"):
+        warnings += 1
+        log_message(f"Warning: {stats['interest_mismatch']} interest line(s) are marked MISMATCH in the Removal Audit Log")
+    return warnings
+
+
+def handle_success(row_count, output_path, elapsed_seconds, button, base_text, default_color, hover_color, stats=None):
     _finish_common()
     app.run_done = True
     if getattr(app, "selected_path", None):
@@ -1128,15 +1410,22 @@ def handle_success(row_count, output_path, elapsed_seconds, button, base_text, d
     duration_str = format_duration(elapsed_seconds)
 
     set_progress("success")
-    set_banner(f"Completed — {int(row_count):,} rows cleaned in {duration_str}", SUCCESS_COLOR)
+    log_message(f"Success! Cleaned {row_count} rows in {duration_str}.")
+    warn_count = log_run_summary(stats)
+    if warn_count:
+        set_banner(f"Completed with {warn_count} warning(s) — {int(row_count):,} rows cleaned in {duration_str}. See the Activity Log.", WARNING_COLOR)
+    else:
+        set_banner(f"Completed — {int(row_count):,} rows cleaned in {duration_str}", SUCCESS_COLOR)
     set_title("Completed")
     update_stats(row_count, elapsed_seconds)
 
     app.last_output_path = output_path
-    log_message(f"Success! Cleaned {row_count} rows in {duration_str}.")
     log_message(f"Saved to: {output_path}")
     open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
     refresh_steps()
+    add_history("warn" if warn_count else "ok", _current_file_name(), base_text,
+                rows=int(row_count), elapsed=elapsed_seconds, warns=warn_count)
+    notify_done("warning" if warn_count else "success", elapsed_seconds)
 
 
 def handle_error(error_message, button, base_text, default_color, hover_color):
@@ -1145,20 +1434,123 @@ def handle_error(error_message, button, base_text, default_color, hover_color):
     set_banner("Something went wrong — details are in the Activity Log", ERROR_COLOR)
     set_title("Failed")
 
-    log_message("Error during cleaning process:")
+    log_message("Error during cleaning process:", level="error")
     for line in error_message.strip().split("\n"):
-        log_message(line)
+        log_message(line, level="error")
     log_message("Tip: make sure the selected file matches the cleaner you chose, then try again.")
     refresh_steps()
+    add_history("err", _current_file_name(), base_text)
+    notify_done("error", time.time() - start_time)
 
 
 # --- File Handlers ---
+_COUNTABLE = (".csv", ".txt", ".xlsx", ".xlsm")
+
+
+def _format_modified(ts):
+    dt = datetime.datetime.fromtimestamp(ts)
+    days = (datetime.date.today() - dt.date()).days
+    clock = dt.strftime("%I:%M %p").lstrip("0")
+    if days == 0:
+        return f"today, {clock}"
+    if days == 1:
+        return f"yesterday, {clock}"
+    return dt.strftime("%b %d, %Y").replace(" 0", " ")
+
+
+def _count_rows(path):
+    """Row count text for the file card (e.g. '48,210 rows'), or None when it can't be told cheaply.
+    Runs in a background thread so big files never freeze the window."""
+    ext = Path(path).suffix.lower()
+    try:
+        if ext in (".csv", ".txt"):
+            lines, last = 0, b""
+            with open(path, "rb") as f:
+                while True:
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    lines += chunk.count(b"\n")
+                    last = chunk[-1:]
+            if last and last != b"\n":
+                lines += 1
+            if ext == ".csv":
+                return f"{max(lines - 1, 0):,} rows"
+            return f"{lines:,} lines"
+        if ext in (".xlsx", ".xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            try:
+                n = wb.active.max_row
+                if not n or n >= 1048576:  # no usable dimension info in the file
+                    return None
+                text = f"{max(n - 1, 0):,} rows"
+                if len(wb.sheetnames) > 1:
+                    text += f" (active sheet of {len(wb.sheetnames)})"
+                return text
+            finally:
+                wb.close()
+    except Exception:
+        return None
+    return None
+
+
+def _render_file_label(count_text, pending=False):
+    name, size_text, modified = app.file_meta
+    parts = []
+    if pending:
+        parts.append("counting rows…")
+    elif count_text:
+        parts.append(count_text)
+    if modified:
+        parts.append(f"modified {modified}")
+    text = f"{name}  •  {size_text}"
+    if parts:
+        text += "\n" + "  ·  ".join(parts)
+    file_label.configure(text=text, text_color=SUCCESS_COLOR)
+
+
+def _start_file_info(filename):
+    """Counts rows off the UI thread and fills in the file card when done (ignored if the file changed)."""
+    token = object()
+    app._info_token = token
+    box = {"text": None, "done": False}
+
+    def work():
+        try:
+            box["text"] = _count_rows(filename)
+        finally:
+            box["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def poll():
+        if getattr(app, "_info_token", None) is not token:
+            return
+        if not box["done"]:
+            app.after(150, poll)
+            return
+        _render_file_label(box["text"])
+        schedule_layout()
+
+    app.after(150, poll)
+
 def process_selected_file(filename):
     if filename:
         short_name = Path(filename).name
         file_size = os.path.getsize(filename)
         size_text = f"{file_size / (1024 * 1024):.2f} MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.1f} KB"
-        file_label.configure(text=f"{short_name}  •  {size_text}", text_color=SUCCESS_COLOR)
+        try:
+            modified = _format_modified(os.path.getmtime(filename))
+        except Exception:
+            modified = ""
+        app.file_meta = (short_name, size_text, modified)
+        can_count = Path(filename).suffix.lower() in _COUNTABLE
+        _render_file_label(None, pending=can_count)
+        if can_count:
+            _start_file_info(filename)
+        else:
+            app._info_token = None
         upload_card.configure(border_color=FILE_LOADED_BORDER, border_width=1)
         app.selected_path = filename
         app.run_done = False
@@ -1194,6 +1586,7 @@ def upload_file(_event=None):
 
 def clear_file():
     app.selected_path = None
+    app._info_token = None
     app.run_done = False
     file_label.configure(text=FILE_PLACEHOLDER, text_color=MUTED_TEXT)
     upload_card.configure(border_color=BORDER_COLOR, border_width=1)
@@ -1211,15 +1604,19 @@ def clear_file():
     schedule_layout()
 
 
+def _open_path(path):
+    if sys.platform == "win32":
+        os.startfile(path)
+    elif sys.platform == "darwin":
+        os.system(f"open '{path}'")
+    else:
+        os.system(f"xdg-open '{path}'")
+
+
 def open_cleaned_file():
     if getattr(app, 'last_output_path', None) and os.path.exists(app.last_output_path):
         try:
-            if sys.platform == "win32":
-                os.startfile(app.last_output_path)
-            elif sys.platform == "darwin":
-                os.system(f"open '{app.last_output_path}'")
-            else:
-                os.system(f"xdg-open '{app.last_output_path}'")
+            _open_path(app.last_output_path)
             log_message(f"Opened file: {Path(app.last_output_path).name}")
         except Exception as e:
             log_message(f"Error opening file: {str(e)}")
@@ -1227,17 +1624,31 @@ def open_cleaned_file():
         log_message("No generated file found to open.")
 
 
+def _reveal_path(path):
+    """Opens the file's folder with the file highlighted (Explorer / Finder)."""
+    path = str(path)
+    if sys.platform == "win32":
+        subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+    elif sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", path])
+    else:
+        subprocess.Popen(["xdg-open", str(Path(path).parent)])
+
+
 def open_destination_folder():
+    last = getattr(app, "last_output_path", None)
+    if last and os.path.exists(last):
+        try:
+            _reveal_path(last)
+            log_message(f"Opened destination folder with {Path(last).name} selected")
+            return
+        except Exception:
+            pass  # fall through to plain folder open
     output_dir = Path.home() / "Desktop" / "Cleaned Data"
-    output_dir.mkdir(parents=True, exist_ok=True)
     try:
-        if sys.platform == "win32":
-            os.startfile(output_dir)
-        elif sys.platform == "darwin":
-            os.system(f"open '{output_dir}'")
-        else:
-            os.system(f"xdg-open '{output_dir}'")
-        log_message("Opened destination folder: Cleaned Data")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _open_path(output_dir)
+        log_message(f"Opened destination folder: {output_dir.name}")
     except Exception as e:
         log_message(f"Error opening folder: {str(e)}")
 
@@ -1247,6 +1658,7 @@ def clear_log(_event=None):
     status_box.configure(state="normal")
     status_box.delete("1.0", "end")
     status_box.configure(state="disabled")
+    _refresh_warn_badge()
     log_message("Activity log cleared.")
 
 
@@ -1261,11 +1673,31 @@ def copy_log():
         log_message(f"Error copying activity log: {e}")
 
 
+def save_log():
+    """Saves the complete activity log (every level, whatever the filter shows) to a text file."""
+    try:
+        content = status_box.get("1.0", "end-1c")
+        out_dir = Path.home() / "Desktop" / "Cleaned Data"
+        last_dir = CONFIG.get("last_dir")
+        initial = out_dir if out_dir.is_dir() else (last_dir if last_dir and os.path.isdir(last_dir) else Path.home())
+        path = filedialog.asksaveasfilename(
+            title="Save Activity Log", initialdir=str(initial), defaultextension=".txt",
+            initialfile=f"activity_log_{datetime.datetime.now():%Y-%m-%d_%H%M}.txt",
+            filetypes=(("Text Files", "*.txt"), ("All Files", "*.*")))
+        if not path:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content + "\n")
+        log_message(f"Saved activity log to: {Path(path).name}")
+    except Exception as e:
+        log_message(f"Error saving activity log: {e}")
+
+
 def custom_askyesno(title, message, allow_remember=True):
     """Modal confirmation. Enter = Yes, Esc = No. Optionally offers 'don't ask again this session'."""
     dialog = ctk.CTkToplevel(app)
     dialog.title(title)
-    dialog_width, dialog_height = 400, (232 if allow_remember else 190)
+    dialog_width, dialog_height = 400, (232 if allow_remember else 214)
     dialog.geometry(f"{dialog_width}x{dialog_height}")
     dialog.resizable(False, False)
     dialog.configure(fg_color=NAVY_BLUE)
@@ -1349,15 +1781,21 @@ def start_cleaner(c):
     if not getattr(app, "selected_path", None):
         log_message("Warning: Please upload a retail file before running the cleaner.")
         return
+    name = Path(app.selected_path).name
+    force = False
     if already_cleaned(app.selected_path, c["label"]):
-        warn_already_cleaned(c["label"])
-        return
-    if not app.skip_confirm:
-        name = Path(app.selected_path).name
+        if not custom_askyesno("Already cleaned",
+                               f"“{name}” was already cleaned with the {c['label']} this session. "
+                               "Run it again anyway? A new output file is created; nothing is overwritten.",
+                               allow_remember=False):
+            warn_already_cleaned(c["label"])
+            return
+        force = True  # they just confirmed, so no second prompt
+    elif not app.skip_confirm:
         if not custom_askyesno("Confirm Action", f"Run the {c['label']} on “{name}”?"):
             log_message(f"{c['label']} cancelled before starting.")
             return
-    run_cleaner_process((c["module"], c["func"]), c["btn"], c["label"], c["color"], c["hover"])
+    run_cleaner_process((c["module"], c["func"]), c["btn"], c["label"], c["color"], c["hover"], force=force)
 
 
 # ======================================================================
@@ -1469,7 +1907,10 @@ if __name__ == "__main__":
     app.last_output_path = None
     app.run_done = False
     app.skip_confirm = False
-    app.stats = {"files": 0, "rows": 0}
+    app.stats = {"files": 0, "rows": 0, "last": None}
+    app.history = []          # this session's runs, newest first
+    app.current_run = None    # (file name, cleaner label) of the run in progress
+    app.file_meta = None
     app.cleaned_log = set()  # (file name, cleaner label) pairs that already finished successfully this session
     CONFIG = load_config()
 
@@ -1478,7 +1919,7 @@ if __name__ == "__main__":
     main_frame.pack(fill="both", expand=True, padx=MAIN_PADX, pady=MAIN_PADY)
 
     _splash_step("Building header…", 0.12)
-    # --- Header (retail gradient banner with price-tag mark) ---
+    # --- Header (retail gradient banner with the app logo) ---
     header_banner = HeaderBanner(
         main_frame, "Strat Data Cleaner", "RETAIL STRATEGY DIVISION  /  DATA ANALYTICS",
         HEADER_STOPS, bg=NAVY_BLUE, on_height_change=lambda: schedule_layout(),
@@ -1553,21 +1994,48 @@ if __name__ == "__main__":
                                            border_color=BRAND_ACCENT, state="disabled", **button_style)
     existing_db_btn = GradientButton(btn_frame, text="Existing DB Cleaner", fg_color=EXISTING_DB_COLOR, hover_color=EXISTING_DB_HOVER,
                                      border_color=EXISTING_DB_ACCENT, state="disabled", **button_style)
-    cleaner_buttons = [cadence_btn, database_btn, brand_performance_btn, existing_db_btn]
+    current_sales_btn = GradientButton(btn_frame, text="Current/Daily Sales Cleaner", fg_color=CURRENT_SALES_COLOR, hover_color=CURRENT_SALES_HOVER,
+                                       border_color=CURRENT_SALES_ACCENT, state="disabled", **button_style)
+    cleaner_buttons = [cadence_btn, database_btn, brand_performance_btn, existing_db_btn, current_sales_btn]
 
     # The module/function pairs are imported by name inside the worker process.
     CLEANERS = [
         {"btn": cadence_btn, "label": "Cadence Cleaner", "color": CADENCE_COLOR, "hover": CADENCE_HOVER,
-         "accent": CADENCE_ACCENT, "module": "cadence_cleaner", "func": "process_cadence"},
+         "accent": CADENCE_ACCENT, "module": "cadence_cleaner", "func": "process_cadence", "desc": "Cadence report. Adds CATEGORY, CHANNEL and PRODUCT_TAG (Raptor, EcoFlow, Insta360, Oura). Offsets returns and rolls up interest and accessories."},
         {"btn": database_btn, "label": "Database Cleaner", "color": DB_COLOR, "hover": DB_HOVER,
-         "accent": DB_ACCENT, "module": "database_cleaner", "func": "process_database"},
+         "accent": DB_ACCENT, "module": "database_cleaner", "func": "process_database", "desc": "Database export with standard store names (e.g. Altitude Alabang Town Center). Offsets returns and rolls up interest and accessories."},
         {"btn": brand_performance_btn, "label": "Brand Performance Cleaner", "color": BRAND_COLOR, "hover": BRAND_HOVER,
-         "accent": BRAND_ACCENT, "module": "brand_performance_cleaner", "func": "process_brand_performance"},
+         "accent": BRAND_ACCENT, "module": "brand_performance_cleaner", "func": "process_brand_performance", "desc": "Brand performance report. Adds CHANNEL_SEGMENT, TRACKED_BRAND and QUARTER, and removes store-days with a negative total."},
         {"btn": existing_db_btn, "label": "Existing DB Cleaner", "color": EXISTING_DB_COLOR, "hover": EXISTING_DB_HOVER,
-         "accent": EXISTING_DB_ACCENT, "module": "existing_db_cleaner", "func": "process_existing_database"},
+         "accent": EXISTING_DB_ACCENT, "module": "existing_db_cleaner", "func": "process_existing_database", "desc": "Re-cleans a database file you already cleaned (reads its DatabaseCleanTable): refreshes month/week/quarter, offsets returns, rolls up interest and accessories."},
+        {"btn": current_sales_btn, "label": "Current/Daily Sales Cleaner", "color": CURRENT_SALES_COLOR, "hover": CURRENT_SALES_HOVER,
+         "accent": CURRENT_SALES_ACCENT, "module": "current_sales_cleaner", "func": "process_current_sales", "desc": "Current/daily sales export with all-caps store names (e.g. ALTITUDE ALABANG TOWN CENTER). Same cleaning as the Database Cleaner."},
     ]
     for _c in CLEANERS:
         _c["btn"].configure(command=lambda c=_c: start_cleaner(c))
+
+    # One-line description of whichever cleaner the pointer (or keyboard focus) is on.
+    DESC_DEFAULT = f"Hover over a cleaner to see what it is for.  Press 1–{len(CLEANERS)} to run one."
+    # The label sits in a frame whose height is reserved for the LONGEST description at the current width
+    # (see _fit_desc_box), so hovering from button to button can never resize or reflow the window.
+    desc_frame = ctk.CTkFrame(left_col, fg_color="transparent", height=32)
+    desc_frame.pack(fill="x", pady=(0, 10))
+    try:
+        desc_frame.pack_propagate(False)
+    except Exception:
+        pass
+    cleaner_desc = ctk.CTkLabel(desc_frame, text=DESC_DEFAULT, font=("Segoe UI", 10), text_color=MUTED_TEXT,
+                                anchor="nw", justify="left", wraplength=400)
+    cleaner_desc.pack(fill="both", expand=True)
+
+    def _show_desc(c=None):
+        cleaner_desc.configure(text=f"{c['label']}:  {c['desc']}" if c else DESC_DEFAULT)
+
+    for _c in CLEANERS:
+        _c["btn"].bind("<Enter>", lambda e, c=_c: _show_desc(c), add="+")
+        _c["btn"].bind("<Leave>", lambda e: _show_desc(), add="+")
+        _c["btn"].bind("<FocusIn>", lambda e, c=_c: _show_desc(c), add="+")
+        _c["btn"].bind("<FocusOut>", lambda e: _show_desc(), add="+")
 
     # Operation status + indeterminate progress bar + cancel
     operation_card = ctk.CTkFrame(left_col, fg_color=CARD_BG, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
@@ -1610,22 +2078,28 @@ if __name__ == "__main__":
                                      command=open_destination_folder, bg=NAVY_BLUE)
     open_folder_btn.grid(row=0, column=1, sticky="ew", padx=(px(6), 0))
 
-    # Session KPI strip (retail-dashboard style)
+    # Session strip: one-line totals plus the most recent runs (scroll for older ones)
     stats_card = ctk.CTkFrame(left_col, fg_color=CARD_BG, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
     stats_card.pack(fill="x")
-    stats_card.grid_columnconfigure((0, 1, 2), weight=1, uniform="stats")
 
-    def make_stat(column, caption, value, accent):
-        cell = ctk.CTkFrame(stats_card, fg_color="transparent")
-        cell.grid(row=0, column=column, sticky="ew", padx=12, pady=8)
-        value_label = ctk.CTkLabel(cell, text=value, font=("Segoe UI", 16, "bold"), text_color=accent, anchor="w")
-        value_label.pack(anchor="w")
-        ctk.CTkLabel(cell, text=caption, font=("Segoe UI", 9, "bold"), text_color=MUTED_TEXT, anchor="w").pack(anchor="w")
-        return value_label
+    hist_head = ctk.CTkFrame(stats_card, fg_color="transparent")
+    hist_head.pack(fill="x", padx=12, pady=(8, 3))
+    ctk.CTkLabel(hist_head, text="THIS SESSION", font=("Segoe UI", 9, "bold"), text_color=MUTED_TEXT).pack(side="left")
+    session_summary = ctk.CTkLabel(hist_head, text="No files cleaned yet", font=("Segoe UI", 10, "bold"),
+                                   text_color=INFO_COLOR, anchor="e")
+    session_summary.pack(side="right")
 
-    stat_files = make_stat(0, "FILES CLEANED THIS SESSION", "0", INFO_COLOR)
-    stat_rows = make_stat(1, "ROWS CLEANED", "0", VIOLET_ACCENT)
-    stat_last = make_stat(2, "LAST RUN", "—", RETAIL_AMBER)
+    # A raw Tk text keeps the history light; its font is rescaled with the DPI like the other raw pieces.
+    hist_text = tk.Text(stats_card, height=3, bg=CARD_BG, fg=LOG_TEXT, bd=0, highlightthickness=0, wrap="none",
+                        cursor="arrow", font=("Segoe UI", -px(11)), padx=0, pady=1, takefocus=0, state="disabled")
+    hist_text.pack(fill="x", padx=12, pady=(0, 8))
+    hist_text.tag_configure("ok", foreground=SUCCESS_COLOR)
+    hist_text.tag_configure("warn", foreground=WARNING_COLOR)
+    hist_text.tag_configure("err", foreground=ERROR_COLOR)
+    hist_text.tag_configure("cancel", foreground=MUTED_TEXT)
+    hist_text.tag_configure("muted", foreground=MUTED_TEXT)
+    hist_text.tag_configure("rest", foreground=LOG_TEXT)
+    _render_history()
 
     # ------------------------------------------------------------------
     # Activity log column
@@ -1637,19 +2111,40 @@ if __name__ == "__main__":
     log_header = ctk.CTkFrame(log_col, fg_color="transparent")
     log_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
 
-    status_label = ctk.CTkLabel(log_header, text="ACTIVITY LOG", font=("Segoe UI", 12, "bold"), text_color=SECTION_TEXT)
+    log_top = ctk.CTkFrame(log_header, fg_color="transparent")
+    log_top.pack(fill="x")
+
+    status_label = ctk.CTkLabel(log_top, text="ACTIVITY LOG", font=("Segoe UI", 12, "bold"), text_color=SECTION_TEXT)
     status_label.pack(side="left")
 
-    log_actions = ctk.CTkFrame(log_header, fg_color="transparent")
+    log_actions = ctk.CTkFrame(log_top, fg_color="transparent")
     log_actions.pack(side="right")
 
-    copy_log_btn = ctk.CTkButton(log_actions, text="Copy", font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG, hover_color="#334155",
-                                 text_color=WHITE, corner_radius=6, height=27, width=58, command=copy_log)
-    copy_log_btn.pack(side="left", padx=(0, 6))
+    def _log_button(text, command, padx):
+        btn = ctk.CTkButton(log_actions, text=text, font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG, hover_color="#334155",
+                            text_color=WHITE, corner_radius=6, height=27, width=54, command=command)
+        btn.pack(side="left", padx=padx)
+        return btn
 
-    clear_log_btn = ctk.CTkButton(log_actions, text="Clear", font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG, hover_color="#334155",
-                                  text_color=WHITE, corner_radius=6, height=27, width=58, command=clear_log)
-    clear_log_btn.pack(side="left")
+    copy_log_btn = _log_button("Copy", copy_log, (0, 6))
+    save_log_btn = _log_button("Save", save_log, (0, 6))
+    clear_log_btn = _log_button("Clear", clear_log, 0)
+
+    # Second row: level filter + a badge that jumps to warnings (shown only when there are some)
+    log_tools = ctk.CTkFrame(log_header, fg_color="transparent")
+    log_tools.pack(fill="x", pady=(6, 0))
+
+    log_filter = ctk.CTkSegmentedButton(log_tools, values=list(LOG_FILTERS), command=_apply_log_filter,
+                                        font=("Segoe UI", 10, "bold"), height=24, corner_radius=6,
+                                        fg_color=SURFACE_BG, unselected_color=SURFACE_BG,
+                                        unselected_hover_color="#334155", selected_color=ACCENT_ORANGE,
+                                        selected_hover_color=HOVER_ORANGE, text_color=WHITE)
+    log_filter.set("All")
+    log_filter.pack(side="left")
+
+    warn_badge = ctk.CTkButton(log_tools, text="", font=("Segoe UI", 10, "bold"), fg_color="#3A2E0C", hover_color="#4D3C0F",
+                               text_color=WARNING_COLOR, border_width=1, border_color="#8A6A12", corner_radius=6,
+                               height=24, width=96, command=jump_to_warning)  # packed by _refresh_warn_badge
 
     status_box = ctk.CTkTextbox(log_col, height=LOG_MIN_HEIGHT, corner_radius=9, fg_color=LOG_BG, text_color=LOG_TEXT,
                                 font=("Consolas", 11), border_width=1, border_color=BORDER_COLOR, wrap="word")
@@ -1659,7 +2154,9 @@ if __name__ == "__main__":
     status_box._textbox.tag_config("success", foreground=SUCCESS_COLOR)
     status_box._textbox.tag_config("warning", foreground=WARNING_COLOR)
     status_box._textbox.tag_config("error", foreground=ERROR_COLOR)
+    status_box._textbox.tag_config("notice", foreground=WARNING_COLOR)
     status_box._textbox.tag_config("processing", foreground=INFO_COLOR)
+    status_box._textbox.tag_config("flash", background="#3B2F0B")  # brief highlight when jumping to a warning
 
     status_box.insert("end", "[System] Application ready. Browse a retail file to begin.\n", "normal")
     status_box.configure(state="disabled")
@@ -1669,7 +2166,7 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------
     footer_frame.grid_columnconfigure(1, weight=1)
     footer_label = ctk.CTkLabel(footer_frame, text=f"STRAT DATA CLEANER  •  {APP_VERSION}", font=("Segoe UI", 10, "bold"), text_color=MUTED_TEXT)
-    footer_hint = ctk.CTkLabel(footer_frame, text="Ctrl+O  Browse    ·    Esc  Cancel    ·    Ctrl+L  Clear log",
+    footer_hint = ctk.CTkLabel(footer_frame, text=f"Ctrl+O  Browse    ·    1–{len(CLEANERS)}  Run cleaner    ·    Esc  Cancel    ·    Ctrl+L  Clear log",
                                font=("Segoe UI", 10), text_color=MUTED_TEXT)
     footer_credit = ctk.CTkLabel(footer_frame, text=f"Retail Strategy Division · Data Analytics · {CURRENT_YEAR}", font=("Segoe UI", 10),
                                  text_color=MUTED_TEXT)
@@ -1692,6 +2189,7 @@ if __name__ == "__main__":
         (upload_card, (0, 12), (0, 8)),
         (step2_row, (0, 6), (0, 4)),
         (btn_frame, (0, 8), (0, 6)),
+        (desc_frame, (0, 10), (0, 6)),
         (operation_card, (0, 12), (0, 8)),
         (step3_row, (0, 6), (0, 4)),
         (output_frame, (0, 8), (0, 6)),
@@ -1713,6 +2211,28 @@ if __name__ == "__main__":
         if _layout["wrap"].get(key) != value:
             _layout["wrap"][key] = value
             label.configure(wraplength=value)
+
+    def _fit_desc_box(wrap_u):
+        """Reserves room for the longest cleaner description at this width, so hovering never changes the layout."""
+        scale = widget_scale(app)
+        key = (int(wrap_u), round(scale, 3))
+        if _layout.get("desc_key") == key:
+            return
+        _layout["desc_key"] = key
+        font = tkfont.Font(root=app, family="Segoe UI", size=-int(round(10 * scale)))
+        limit = max(wrap_u * scale - 16, 40)  # small safety margin so the real label never wraps one line more
+        longest = 1
+        for text in [DESC_DEFAULT] + [f"{c['label']}:  {c['desc']}" for c in CLEANERS]:
+            lines, current = 1, ""
+            for word in text.split():
+                trial = f"{current} {word}".strip()
+                if current and font.measure(trial) > limit:
+                    lines += 1
+                    current = word
+                else:
+                    current = trial
+            longest = max(longest, lines)
+        desc_frame.configure(height=int((longest * font.metrics("linespace") + 6) / scale) + 1)
 
     def set_density(compact):
         """Normal vs compact spacing. Compact is used automatically only when the screen is too short."""
@@ -1777,7 +2297,10 @@ if __name__ == "__main__":
         return main_frame.winfo_reqheight() / widget_scale(app) + 2 * _layout["main_pady"] + 2
 
     def _avail_height_u():
-        """Usable window height (unscaled) on this screen, after taskbar + title bar."""
+        """Usable window height (unscaled) on the monitor the window is on, after taskbar + title bar."""
+        work = _monitor_work_height_px()
+        if work:
+            return (work - TITLEBAR_RESERVE_PX) / widget_scale(app)
         return (app.winfo_screenheight() - SCREEN_RESERVE_PX) / widget_scale(app)
 
     def update_min_size():
@@ -1830,6 +2353,8 @@ if __name__ == "__main__":
         # 4) Wrap text to the room that is actually available (never shrink the text itself)
         _set_wrap(file_label, "file", col_w - 234 - 24)
         _set_wrap(live_status_banner, "banner", col_w - 154)
+        _set_wrap(cleaner_desc, "desc", col_w - 8)
+        _fit_desc_box(_layout["wrap"]["desc"])
 
         # 5) Keep the minimum size in sync with whatever the layout now needs
         update_min_size()
@@ -1872,7 +2397,47 @@ if __name__ == "__main__":
         open_output_btn.grid_configure(padx=(0, px(6)))
         open_folder_btn.grid_configure(padx=(px(6), 0))
         progress.grid_configure(padx=px(14), pady=(0, px(10)))
+        hist_text.configure(font=("Segoe UI", -px(11)))
         _layout["cols"] = None  # rebuilds the cleaner grid (and its px() gaps) on the next layout pass
+
+    def _refit_after_move(step=0):
+        """
+        Re-fits the layout after the window lands on another monitor. Run a few times on purpose: right after
+        the move CustomTkinter is still rescaling its widgets, so a single pass can measure half-updated sizes
+        and leave the log or footer clipped (which a manual full-screen toggle used to fix).
+        """
+        _layout["refit_job"] = None
+        try:
+            _layout["mode"] = None       # grid minsizes are px() values of the old scale: rebuild them
+            _layout["cols"] = None
+            _layout["desc_key"] = None
+            _layout["wrap"].clear()
+            if _layout["compact"]:       # the new monitor may have room again; update_min_size re-compacts if not
+                set_density(False)
+            apply_layout()
+
+            app.update_idletasks()
+            scale = widget_scale(app)
+            win_bottom = app.winfo_rooty() + app.winfo_height()
+            footer_bottom = footer_frame.winfo_rooty() + footer_frame.winfo_height()
+            if footer_bottom > win_bottom + 1 or status_box.winfo_height() < px(60):
+                if not _layout["compact"]:
+                    set_density(True)
+                height = int(min(_need_height_u(), _avail_height_u()))
+                app.geometry(f"{int(app.winfo_width() / scale)}x{height}")
+            if step < 2:
+                _layout["refit_job"] = app.after((900, 1800)[step], lambda: _refit_after_move(step + 1))
+        except Exception:
+            pass
+
+    def _schedule_refit():
+        job = _layout.get("refit_job")
+        if job is not None:
+            try:
+                app.after_cancel(job)
+            except Exception:
+                pass
+        _layout["refit_job"] = app.after(350, _refit_after_move)
 
     def _check_scale():
         """Cheap 120 ms watcher: when the DPI scale changes, refresh the raw-canvas pieces once, then re-layout."""
@@ -1891,6 +2456,13 @@ if __name__ == "__main__":
                 _apply_scaled_paddings()
                 header_banner.refresh()
                 schedule_layout()
+                _schedule_refit()
+            # Same DPI scale but a different monitor (e.g. a bigger one): refit as well.
+            work = _monitor_work_height_px()
+            if work is not None:
+                if _layout.get("work_h") not in (None, work):
+                    _schedule_refit()
+                _layout["work_h"] = work
         except Exception:
             pass
         try:
@@ -1974,8 +2546,60 @@ if __name__ == "__main__":
     app.bind("<Control-L>", clear_log)
     app.bind("<Escape>", request_cancel)
 
+    def _cleaner_shortcut(index):
+        def handler(_event=None):
+            if getattr(app, "is_processing", False):
+                return
+            if not getattr(app, "selected_path", None):
+                log_message("Warning: Please upload a retail file before running the cleaner.")
+                return
+            start_cleaner(CLEANERS[index])
+        return handler
+
+    for _i in range(len(CLEANERS)):
+        app.bind(f"<Key-{_i + 1}>", _cleaner_shortcut(_i))
+
+    def _save_window_state():
+        """Remembers the window's size (DPI-independent units) and position for the next launch."""
+        try:
+            if app.state() != "normal":
+                return
+            m = re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", app.geometry())
+            if not m:
+                return
+            CONFIG["window"] = {"w": int(m.group(1)), "h": int(m.group(2)),
+                                "x": int(m.group(3)), "y": int(m.group(4))}
+            save_config(CONFIG)
+        except Exception:
+            pass
+
+    def restore_window_state():
+        """Re-applies the saved size and position, unless that would put the window off-screen
+        (e.g. a monitor that is no longer connected); then the automatic fit-and-center stands."""
+        saved = CONFIG.get("window")
+        if not isinstance(saved, dict):
+            return
+        try:
+            w, h, x, y = (int(saved[k]) for k in ("w", "h", "x", "y"))
+        except Exception:
+            return
+        app.update_idletasks()
+        scale = widget_scale(app)
+        vx, vy = app.winfo_vrootx(), app.winfo_vrooty()
+        vw, vh = app.winfo_vrootwidth(), app.winfo_vrootheight()
+        pw = w * scale
+        visible_w = min(x + pw, vx + vw) - max(x, vx)
+        if visible_w < 160 or not (vy - 10 <= y <= vy + vh - 80):
+            return
+        min_w, min_h = tk.Wm.wm_minsize(app)
+        w = int(max(min(w, (vw - 40) / scale), min_w / scale))
+        h = int(max(min(h, (vh - 80) / scale), min_h / scale))
+        app.geometry(f"{w}x{h}+{x}+{y}")
+        app.update_idletasks()
+
     def on_close():
         """Never leave a worker process running after the window closes."""
+        _save_window_state()
         try:
             if _layout["scale_job"] is not None:
                 app.after_cancel(_layout["scale_job"])
@@ -2005,6 +2629,10 @@ if __name__ == "__main__":
         fit_and_place()
     except Exception:
         app.geometry("1100x700")
+    try:
+        restore_window_state()
+    except Exception:
+        pass
     _layout["scale"] = widget_scale(app)
     _layout["scale_job"] = app.after(120, _check_scale)
     schedule_layout()
