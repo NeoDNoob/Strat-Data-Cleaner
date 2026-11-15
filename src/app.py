@@ -19,6 +19,7 @@ import time
 import traceback
 import subprocess
 import re
+import math
 
 from PIL import Image, ImageDraw, ImageTk
 
@@ -107,6 +108,8 @@ SUCCESS_COLOR = "#34D399"
 WARNING_COLOR = "#FBBF24"
 ERROR_COLOR = "#F87171"
 INFO_COLOR = "#60A5FA"
+LOG_STAMP = "#6E7F99"          # timestamps in the activity log
+LOG_FRESH_BG = "#16294D"       # background a new log line fades out of
 
 # Operation-card border follows the current status (a quiet highlight).
 STATE_BORDERS = {
@@ -126,6 +129,8 @@ STEP_DONE_TITLE = "#8FD9B8"
 
 # --- Layout constants (unscaled units) ---
 MIN_WIDTH = 520
+FIXED_WIDTH = 1020            # the window's fixed width (unscaled): two panes, fits a 1366 px laptop even at 125 % scale
+FADE_IN_MS = 220              # fade-in of the real window after the loading screen (0 = appear instantly)
 DUAL_BREAKPOINT = 980         # at/above this width: controls on the left, activity log on the right
 MIN_LEFT = 520                # minimum width of the controls column in two-pane mode
 MIN_RIGHT = 320               # minimum width of the log column in two-pane mode
@@ -161,32 +166,26 @@ except Exception:
     _ScalingTracker = None
 
 
-def _monitor_work_height_px():
-    """Usable height (real pixels, taskbar excluded) of the monitor the window is on right now.
-    Tk's winfo_screenheight() only describes the primary monitor, so it is wrong after the window is
-    moved to another one. Returns None when unknown (non-Windows or any failure)."""
-    if sys.platform != "win32":
-        return None
-    try:
-        from ctypes import wintypes
-
-        class _MONITORINFO(ctypes.Structure):
-            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
-                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
-
-        user32 = ctypes.windll.user32
-        user32.MonitorFromWindow.restype = ctypes.c_void_p
-        user32.MonitorFromWindow.argtypes = [ctypes.c_void_p, wintypes.DWORD]
-        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
-        hwnd = user32.GetParent(app.winfo_id()) or app.winfo_id()
-        handle = user32.MonitorFromWindow(hwnd, 2)  # MONITOR_DEFAULTTONEAREST
-        info = _MONITORINFO()
-        info.cbSize = ctypes.sizeof(_MONITORINFO)
-        if handle and user32.GetMonitorInfoW(handle, ctypes.byref(info)):
-            return int(info.rcWork.bottom - info.rcWork.top)
-    except Exception:
-        pass
-    return None
+def lock_fixed_scale():
+    """One UI scale for the whole run, on every monitor. CustomTkinter's per-monitor DPI tracking is switched off
+    (it is what re-scaled every widget, and flashed the window, each time it met a different monitor); the app
+    uses the system scale once and keeps it. Windows itself scales the finished window if it is shown on a
+    monitor with another DPI, so the window is the same size and layout everywhere and nothing is re-laid out."""
+    ctk.deactivate_automatic_dpi_awareness()
+    scale = 1.0
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)      # system-DPI aware (a no-op error if already set)
+        except Exception:
+            pass
+        try:
+            scale = ctypes.windll.user32.GetDpiForSystem() / 96.0
+        except Exception:
+            scale = 1.0
+    scale = max(1.0, min(scale, 3.0))
+    ctk.set_widget_scaling(scale)
+    ctk.set_window_scaling(scale)
+    return scale
 
 
 def widget_scale(widget):
@@ -205,6 +204,76 @@ def widget_scale(widget):
 def px(value, widget=None):
     """Scale an unscaled value to real pixels (for plain tk widgets like Canvas)."""
     return int(round(value * widget_scale(widget if widget is not None else app)))
+
+
+# ======================================================================
+# Motion: one shared clock for every short UI animation
+#   * a single ~30 fps timer that only runs while something is animating
+#   * time comes from the clock (a slow frame catches up instead of slowing the motion down)
+#   * while the window is minimized every animation jumps to its end state
+#   * before the first reveal (`_motion["on"]` is False) changes apply instantly, so nothing plays at startup
+# ======================================================================
+_motion = {"on": False}
+_anim = {"items": {}, "job": None}
+ANIM_FRAME_MS = 33
+
+
+def _ease_out(t):
+    return 1.0 - (1.0 - t) ** 3
+
+
+def _linear(t):
+    return t
+
+
+def animate(key, duration_ms, step, done=None, ease=_ease_out):
+    """Runs step(eased_t) from 0 to 1 on the shared clock. Starting a key again replaces the running
+    animation with that key. With motion off, or a zero duration, it jumps straight to the end state."""
+    _anim["items"].pop(key, None)
+    if not _motion["on"] or duration_ms <= 0:
+        step(1.0)
+        if done:
+            done()
+        return
+    _anim["items"][key] = {"t0": time.perf_counter(), "dur": duration_ms / 1000.0,
+                           "step": step, "done": done, "ease": ease}
+    if _anim["job"] is None:
+        _anim["job"] = app.after(ANIM_FRAME_MS, _anim_tick)
+
+
+def animate_cancel(key):
+    _anim["items"].pop(key, None)
+
+
+def _anim_tick():
+    _anim["job"] = None
+    try:
+        minimized = app.state() == "iconic"
+    except Exception:
+        minimized = False
+    now = time.perf_counter()
+    for key, item in list(_anim["items"].items()):
+        if _anim["items"].get(key) is not item:   # replaced or cancelled by an earlier step this frame
+            continue
+        t = 1.0 if minimized else min(1.0, (now - item["t0"]) / item["dur"])
+        try:
+            item["step"](item["ease"](t))
+            finished = t >= 1.0
+        except Exception:                          # e.g. the widget is gone: finish the animation quietly
+            finished = True
+        if finished:
+            if _anim["items"].get(key) is item:
+                del _anim["items"][key]
+            if item["done"]:
+                try:
+                    item["done"]()
+                except Exception:
+                    pass
+    if _anim["items"]:
+        try:
+            _anim["job"] = app.after(ANIM_FRAME_MS, _anim_tick)
+        except Exception:
+            pass
 
 
 # ======================================================================
@@ -363,6 +432,12 @@ class GradientButton(tk.Canvas):
         self._gb_img = None
         self._gb_txt = None
         self._gb_photo = None
+        self._gb_lvl = 0.0            # hover amount 0..1 (animated, quantised to steps of 0.2 so redraws stay cached)
+        self._gb_key = ("gb", id(self))
+        self._gb_cap = ""             # optional keycap hint in the corner (e.g. "1")
+        self._gb_cap_items = None
+        self._gb_cap_key = None
+        self._gb_cap_ok = True
 
         self.bind("<Configure>", self._on_configure)
         self.bind("<Enter>", lambda e: self._set_flag("_gb_hover", True))
@@ -430,16 +505,16 @@ class GradientButton(tk.Canvas):
         if self._gb_state == "disabled":
             return {"stops": [OPEN_BTN_DISABLED, OPEN_BTN_DISABLED], "border": DISABLED_BORDER,
                     "text": DISABLED_TEXT, "sheen": 0.0}
-        active = self._gb_hover or self._gb_pressed
-        base = self._gb_hover_color if active else self._gb_fg
+        lvl = 1.0 if self._gb_pressed else self._gb_lvl   # press is instant; hover eases in and out
+        base = _mix(self._gb_fg, self._gb_hover_color, lvl)
         flat = self._gb_fg == self._gb_hover_color
         if flat:
             stops = [base, base]
         else:
             if self._gb_gradient_to:
-                end = _mix(self._gb_gradient_to, "#FFFFFF", 0.12) if active else self._gb_gradient_to
+                end = _mix(self._gb_gradient_to, "#FFFFFF", 0.12 * lvl)
             elif self._gb_border:
-                end = _mix(base, self._gb_border, 0.55 if active else 0.40)
+                end = _mix(base, self._gb_border, 0.40 + 0.15 * lvl)
             else:
                 end = _mix(base, "#FFFFFF", 0.15)
             stops = [base, end]
@@ -462,7 +537,10 @@ class GradientButton(tk.Canvas):
         setattr(self, name, value)
         if also_unpress:
             self._gb_pressed = False
-        self._schedule(immediate=True)
+        if name == "_gb_hover":
+            self._tween_hover()
+        else:
+            self._schedule(immediate=True)
 
     def _on_press(self, _e):
         if self._gb_state != "normal":
@@ -519,6 +597,77 @@ class GradientButton(tk.Canvas):
             self.itemconfigure(self._gb_img, image=photo)
             self.itemconfigure(self._gb_txt, text=self._gb_text, fill=st["text"], font=self._scaled_font())
             self.coords(self._gb_txt, w / 2, h / 2)
+        self._draw_keycap(w, h, st, scale)
+
+    # ---- motion + keycap ----
+    def _tween_hover(self, duration=120):
+        """Eases the hover amount toward 1 (pointer over) or 0 (pointer away)."""
+        target = 1.0 if self._gb_hover else 0.0
+        start = self._gb_lvl
+        if start == target:
+            animate_cancel(self._gb_key)
+            self._schedule(immediate=True)
+            return
+
+        def step(t):
+            lvl = round((start + (target - start) * t) * 5) / 5.0
+            if lvl != self._gb_lvl:
+                self._gb_lvl = lvl
+                self._schedule(immediate=True)
+
+        animate(self._gb_key, duration, step)
+
+    def pulse(self):
+        """A brief brighten that fades back; used when a button becomes available."""
+        if self._gb_state != "normal" or not _motion["on"]:
+            return
+        self._gb_lvl = 1.0
+        self._schedule(immediate=True)
+        self._tween_hover(duration=380)
+
+    def set_keycap(self, text):
+        """Shows a small key hint (e.g. the 1-5 shortcut) in the button's right corner."""
+        self._gb_cap = str(text)
+        self._gb_cap_key = None
+        self._schedule(immediate=True)
+
+    def _draw_keycap(self, w, h, st, scale):
+        if not self._gb_cap:
+            return
+        side = max(int(round(18 * scale)), 12)
+        pad = max(int(round(10 * scale)), 6)
+        x1 = w - pad
+        x0 = x1 - side
+        y0 = (h - side) // 2
+        y1 = y0 + side
+        base = st["stops"][0]
+        fill = _mix(base, "#000000", 0.28)
+        outline = _mix(base, "#FFFFFF", 0.22)
+        ink = _mix(st["text"], base, 0.30)
+        font = (self._gb_font[0], -max(int(round(side * 0.62)), 8), "bold")
+
+        key = (w, self._gb_text, self._gb_font, scale)
+        if key != self._gb_cap_key:   # hide the hint when the label is so long that it would collide with it
+            self._gb_cap_key = key
+            try:
+                text_w = tkfont.Font(root=self, font=self._scaled_font()).measure(self._gb_text)
+                self._gb_cap_ok = text_w <= w - 2 * (side + 2 * pad)
+            except Exception:
+                self._gb_cap_ok = True
+
+        if self._gb_cap_items is None:
+            rect = self.create_rectangle(x0, y0, x1, y1, fill=fill, outline=outline)
+            txt = self.create_text((x0 + x1) / 2, (y0 + y1) / 2, text=self._gb_cap, fill=ink, font=font)
+            self._gb_cap_items = (rect, txt)
+        else:
+            rect, txt = self._gb_cap_items
+            self.coords(rect, x0, y0, x1, y1)
+            self.itemconfigure(rect, fill=fill, outline=outline)
+            self.coords(txt, (x0 + x1) / 2, (y0 + y1) / 2)
+            self.itemconfigure(txt, text=self._gb_cap, fill=ink, font=font)
+        visible = "normal" if self._gb_cap_ok else "hidden"
+        self.itemconfigure(rect, state=visible)
+        self.itemconfigure(txt, state=visible)
 
 
 def _tag_icon(size):
@@ -706,6 +855,7 @@ class SmoothProgressBar(tk.Canvas):
         self._pb_size = (0, 0)
         self._pb_track = None
         self._pb_bar = None
+        self._pb_key = ("progress", id(self))
         self.bind("<Configure>", self._on_configure)
 
     # ---- CTkProgressBar-compatible API ----
@@ -726,12 +876,26 @@ class SmoothProgressBar(tk.Canvas):
     config = configure
 
     def set(self, value):
+        animate_cancel(self._pb_key)
         self._pb_value = max(0.0, min(1.0, float(value)))
         self._draw()
+
+    def animate_to(self, value, ms=320, from_value=None):
+        """Eases the determinate fill to `value` (used for the finish sweep)."""
+        value = max(0.0, min(1.0, float(value)))
+        start = self._pb_value if from_value is None else max(0.0, min(1.0, float(from_value)))
+        self._pb_value = start
+
+        def step(t):
+            self._pb_value = start + (value - start) * t
+            self._draw()
+
+        animate(self._pb_key, ms, step)
 
     def start(self):
         if self._pb_running:
             return
+        animate_cancel(self._pb_key)
         self._pb_running = True
         self._pb_t0 = time.perf_counter()
         self._tick()
@@ -787,6 +951,7 @@ class SmoothProgressBar(tk.Canvas):
         if self._pb_mode == "indeterminate":
             seg = max(span * 0.35, float(h))        # length of the moving segment
             phase = ((time.perf_counter() - self._pb_t0) / self._PERIOD) % 1.0
+            phase += (phase * phase * (3.0 - 2.0 * phase) - phase) * 0.7   # ease in/out: lingers off-screen, glides through
             head = phase * (span + seg)             # slides in from the left, out through the right
             a, b = max(head - seg, 0.0), min(head, float(span))
         else:
@@ -835,47 +1000,58 @@ def _apply_log_filter(mode=None):
     for level in _LOG_LEVELS:
         tb.tag_configure(level, elide=(keep is not None and level != keep))
     tb.see("end")
+    _refresh_warn_badge()
 
 
 def _refresh_warn_badge():
-    """Keeps the 'N warnings' badge in step with the warning lines currently in the log."""
+    """Shows the number of warnings inside the 'Warnings' filter itself (no separate badge)."""
     try:
         count = len(status_box._textbox.tag_ranges("warnline")) // 2
+        btn = log_filter._buttons_dict["Warnings"]
         if count:
-            warn_badge.configure(text=f"⚠ {count} warning{'s' if count != 1 else ''}")
-            if not _log_state["badge_shown"]:
-                warn_badge.pack(side="left", padx=(8, 0))
-                _log_state["badge_shown"] = True
+            colour = WHITE if _log_state["filter"] == "Warnings" else WARNING_COLOR
+            btn.configure(text=f"⚠ Warnings {count}", text_color=colour)
         else:
-            if _log_state["badge_shown"]:
-                warn_badge.pack_forget()
-                _log_state["badge_shown"] = False
-            _log_state["warn_idx"] = -1
+            btn.configure(text="Warnings", text_color=WHITE)
     except Exception:
         pass
 
 
-def jump_to_warning(_event=None):
-    """Scrolls to the newest warning, then to the next older one on every further click."""
+# ======================================================================
+# Toast: a small message pill that fades in, waits and fades out (one at a time)
+# ======================================================================
+TOAST_KINDS = {"info": INFO_COLOR, "success": SUCCESS_COLOR, "warning": WARNING_COLOR, "error": ERROR_COLOR}
+_toast = {"label": None}
+
+
+def show_toast(text, kind="info"):
+    """Brief confirmation at the bottom-right of the window (instead of adding a line to the log)."""
     try:
-        tb = status_box._textbox
-        ranges = tb.tag_ranges("warnline")
-        count = len(ranges) // 2
-        if not count:
-            return
-        if _log_state["filter"] == "Errors":  # warnings are hidden under the Errors filter
-            log_filter.set("All")
-            _apply_log_filter("All")
-        idx = _log_state["warn_idx"]
-        idx = count - 1 if idx < 0 or idx >= count else (idx - 1) % count
-        _log_state["warn_idx"] = idx
-        start = str(ranges[2 * idx])
-        tb.see(start)
-        tb.tag_remove("flash", "1.0", "end")
-        tb.tag_add("flash", start, f"{start} lineend +1c")
-        if _log_state["flash_job"] is not None:
-            app.after_cancel(_log_state["flash_job"])
-        _log_state["flash_job"] = app.after(1400, lambda: tb.tag_remove("flash", "1.0", "end"))
+        accent = TOAST_KINDS.get(kind, INFO_COLOR)
+        lbl = _toast["label"]
+        if lbl is None:
+            lbl = tk.Label(app, bd=0, padx=px(14), pady=px(8), highlightthickness=1,
+                           font=("Segoe UI", -px(12), "bold"))
+            _toast["label"] = lbl
+        lbl.configure(text=text)
+        total, fade_in, fade_out = 2000.0, 160.0, 320.0
+
+        def step(t):                       # t is linear over the toast's whole life
+            ms = t * total
+            if ms < fade_in:
+                a = ms / fade_in
+            elif ms > total - fade_out:
+                a = max(0.0, (total - ms) / fade_out)
+            else:
+                a = 1.0
+            lbl.configure(bg=_mix(NAVY_BLUE, SURFACE_BG, a), fg=_mix(NAVY_BLUE, WHITE, a),
+                          highlightbackground=_mix(NAVY_BLUE, accent, a), highlightcolor=_mix(NAVY_BLUE, accent, a))
+            rise = int((1.0 - min(1.0, ms / fade_in)) * px(8))      # slides up while it fades in
+            lbl.place(relx=1.0, rely=1.0, x=-px(22), y=-px(50) + rise, anchor="se")
+
+        step(0.0)
+        lbl.lift()
+        animate("toast", total, step, lbl.place_forget, ease=_linear)
     except Exception:
         pass
 
@@ -883,6 +1059,20 @@ def jump_to_warning(_event=None):
 # ======================================================================
 # Logging, status banner, window title, progress
 # ======================================================================
+def _pulse_log_line():
+    """The newest log line starts with a soft highlight that fades out."""
+    try:
+        tb = status_box._textbox
+
+        def step(t):
+            tb.tag_configure("fresh", background=_mix(LOG_FRESH_BG, LOG_BG, t))
+
+        step(0.0)
+        animate("logfresh", 750, step, lambda: tb.tag_remove("fresh", "1.0", "end"))
+    except Exception:
+        pass
+
+
 def log_message(message, level=None):
     """Inserts a timestamped color-coded message into the inline status box safely."""
     global status_box
@@ -909,12 +1099,20 @@ def log_message(message, level=None):
 
             tb = status_box._textbox
             tags = (tag, "warnline") if tag == "warning" else (tag,)
-            tb.insert("end", f"[{timestamp}] {message}\n", tags)
+            # The timestamp is muted; the line break carries only the level tag (not "warnline"), so two
+            # warnings in a row stay two separate ranges and the warning badge counts them correctly.
+            tb.insert("end", f"[{timestamp}] ", tags + ("stamp",))
+            tb.insert("end", message, tags)
+            tb.insert("end", "\n", (tag,))
 
             # Keep the log bounded so long sessions never slow the UI down.
             extra = int(tb.index("end-1c").split(".")[0]) - MAX_LOG_LINES
             if extra > 0:
                 tb.delete("1.0", f"{extra + 1}.0")
+
+            tb.tag_remove("fresh", "1.0", "end")
+            tb.tag_add("fresh", "end-2c linestart", "end-1c")
+            _pulse_log_line()
 
             status_box.see("end")
             status_box.configure(state="disabled")
@@ -926,17 +1124,102 @@ def log_message(message, level=None):
     print(f"[Startup Log] {message}")
 
 
-_banner_border = None
+# --- Fixed-height text -------------------------------------------------------------------------------
+# A label that re-wraps (a timer ticking in the banner, a long file name) changes its height, and everything
+# below it jumps. These labels are instead cut to a fixed number of lines with an ellipsis, so their height
+# never changes. The full text is kept and re-fitted whenever the width or the DPI scale changes.
+_clamped = {}          # key -> (label, full text, point size, max lines, max lines per paragraph, extra configure args)
+_clamped_shown = {}    # key -> text currently on the label
+_measure_fonts = {}
+
+
+def _measure_font(size, scale):
+    key = (size, round(scale, 3))
+    font = _measure_fonts.get(key)
+    if font is None:
+        font = tkfont.Font(root=app, family="Segoe UI", size=-int(round(size * scale)))
+        _measure_fonts[key] = font
+    return font
+
+
+def _ellipsize(text, font, limit):
+    text = text.rstrip()
+    if font.measure(text) <= limit:
+        return text
+    while text and font.measure(text + "…") > limit:
+        text = text[:-1]
+    return text.rstrip() + "…"
+
+
+def _clamp_lines(text, size, wrap_u, max_lines, para_lines=None):
+    """Word-wraps `text` the way the label will and cuts it to `max_lines` lines (ending in an ellipsis)."""
+    scale = widget_scale(app)
+    font = _measure_font(size, scale)
+    limit = max(wrap_u * scale - 16, 40)      # same safety margin as _fit_desc_box
+    lines = []
+    for para in text.split("\n"):
+        if para_lines == 1:                    # one line only: no wrapping, just cut with an ellipsis
+            lines.append(_ellipsize(para, font, limit))
+            continue
+        para_out, current = [], ""
+        for word in para.split(" "):
+            trial = f"{current} {word}" if current else word
+            if current and font.measure(trial) > limit:
+                para_out.append(current)
+                current = word
+            else:
+                current = trial
+        para_out.append(current)
+        para_out = [_ellipsize(l, font, limit) for l in para_out]
+        if para_lines is not None and len(para_out) > para_lines:
+            para_out = para_out[:para_lines]
+            para_out[-1] = _ellipsize(para_out[-1] + " …", font, limit)
+        lines.extend(para_out)
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        lines[-1] = _ellipsize(lines[-1] + " …", font, limit)
+    return "\n".join(lines)
+
+
+def _render_clamped(key):
+    label, text, size, max_lines, para_lines, extra = _clamped[key]
+    layout = globals().get("_layout") or {}
+    wrap_u = layout.get("wrap", {}).get(key)
+    try:
+        shown = _clamp_lines(text, size, wrap_u, max_lines, para_lines) if wrap_u else text
+        if extra or _clamped_shown.get(key) != shown:
+            _clamped_shown[key] = shown
+            label.configure(text=shown, **extra)
+    except Exception:
+        label.configure(text=text, **extra)
+
+
+def set_clamped_text(label, key, text, size, max_lines, para_lines=None, **extra):
+    _clamped[key] = (label, text, size, max_lines, para_lines, extra)
+    _render_clamped(key)
+
+
+_banner_fx = {"text": MUTED_TEXT, "border": BORDER_COLOR,           # what is on screen right now
+              "to_text": MUTED_TEXT, "to_border": BORDER_COLOR}    # where the current fade is heading
 
 
 def set_banner(text, color):
-    """Updates the live status banner and tints the card border to match the state."""
-    global _banner_border
-    live_status_banner.configure(text=text, text_color=color)
+    """Updates the live status banner; its colour and the card border fade to the new state."""
+    set_clamped_text(live_status_banner, "banner", text, 11, 2)
     border = STATE_BORDERS.get(color, BORDER_COLOR)
-    if border != _banner_border:
-        _banner_border = border
-        operation_card.configure(border_color=border)
+    fx = _banner_fx
+    if color == fx["to_text"] and border == fx["to_border"]:
+        return
+    fx["to_text"], fx["to_border"] = color, border
+    from_text, from_border = fx["text"], fx["border"]
+
+    def step(t):
+        fx["text"] = _mix(from_text, color, t)
+        fx["border"] = _mix(from_border, border, t)
+        live_status_banner.configure(text_color=fx["text"])
+        operation_card.configure(border_color=fx["border"])
+
+    animate("banner", 240, step)
 
 
 def set_title(suffix=None):
@@ -955,10 +1238,12 @@ def set_progress(state):
         progress.configure(mode="determinate")
         if state == "success":
             progress.configure(progress_color=SUCCESS_COLOR)
-            progress.set(1)
+            progress.set(0)
+            progress.animate_to(1.0)       # the bar sweeps full instead of snapping
         elif state == "error":
             progress.configure(progress_color=ERROR_COLOR)
-            progress.set(1)
+            progress.set(0)
+            progress.animate_to(1.0)
         else:
             progress.set(0)
     except Exception:
@@ -971,6 +1256,29 @@ _STEP_STYLE = {
     "active": (STEP_ACTIVE_BG, WHITE, WHITE),
     "done": (STEP_DONE_BG, SUCCESS_COLOR, STEP_DONE_TITLE),
 }
+
+
+_step_goal = {}   # step index -> (badge bg, badge text, title colour) it is fading toward
+_step_cur = {}    # ... and what is on screen right now
+
+
+def _fade_step(i, badge, title, target, pop):
+    """Crossfades one step badge/title to its new colours; badges that light up get a brief highlight."""
+    if _step_goal.get(i) == target:
+        return
+    _step_goal[i] = target
+    start = _step_cur.get(i, target)
+
+    def step(t):
+        bg = _mix(start[0], target[0], t)
+        fg = _mix(start[1], target[1], t)
+        tc = _mix(start[2], target[2], t)
+        _step_cur[i] = (bg, fg, tc)
+        shown = _mix(bg, "#FFFFFF", 0.30 * math.sin(math.pi * t)) if (pop and t < 1.0) else bg
+        badge.configure(fg_color=shown, text_color=fg)
+        title.configure(text_color=tc)
+
+    animate(("step", i), 260, step)
 
 
 def refresh_steps():
@@ -988,10 +1296,10 @@ def refresh_steps():
     else:
         states, hint, hint_color = ("done", "active", "todo"), "Pick the cleaner that fits your file", INFO_COLOR
 
-    for (badge, title, number), state in zip(step_widgets, states):
+    for i, ((badge, title, number), state) in enumerate(zip(step_widgets, states)):
         bg, fg, title_color = _STEP_STYLE[state]
-        badge.configure(fg_color=bg, text_color=fg, text="✓" if state == "done" else str(number))
-        title.configure(text_color=title_color)
+        badge.configure(text="✓" if state == "done" else str(number))
+        _fade_step(i, badge, title, (bg, fg, title_color), pop=(state != "todo"))
     step2_hint.configure(text=hint, text_color=hint_color)
 
 
@@ -1145,15 +1453,34 @@ def poll_worker(button, base_text, default_color, hover_color):
         handle_error(msg[1], button, base_text, default_color, hover_color)
 
 
-def set_cleaners_enabled(enabled, except_btn=None):
-    """Enables/disables all cleaner buttons, restoring their own colors and labels when enabling."""
-    for c in CLEANERS:
+_unlock_jobs = []
+
+
+def _enable_cleaner(b, c, pulse=False):
+    b.configure(state="normal", fg_color=c["color"], hover_color=c["hover"],
+                border_color=c["accent"], text=c["label"])
+    if pulse:
+        b.pulse()
+
+
+def set_cleaners_enabled(enabled, except_btn=None, stagger=False):
+    """Enables/disables all cleaner buttons, restoring their own colors and labels when enabling.
+    With stagger=True, buttons that were disabled wake up one after another with a brief glow."""
+    for job in _unlock_jobs:
+        try:
+            app.after_cancel(job)
+        except Exception:
+            pass
+    _unlock_jobs.clear()
+    for i, c in enumerate(CLEANERS):
         b = c["btn"]
         if b is except_btn:
             continue
         if enabled:
-            b.configure(state="normal", fg_color=c["color"], hover_color=c["hover"],
-                        border_color=c["accent"], text=c["label"])
+            if stagger and _motion["on"] and b.cget("state") == "disabled":
+                _unlock_jobs.append(app.after(i * 45, lambda b=b, c=c: _enable_cleaner(b, c, pulse=True)))
+            else:
+                _enable_cleaner(b, c)
         else:
             b.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
 
@@ -1310,36 +1637,81 @@ def _current_file_name():
     return Path(path).name if path else "(no file)"
 
 
+def _hist_hover(tag_name, on):
+    hist_text.tag_configure(tag_name, underline=on)
+    hist_text.configure(cursor="hand2" if on else "arrow")
+
+
+def _open_history_file(path):
+    """Click on a finished run: show its cleaned file in Explorer / Finder."""
+    if path and os.path.exists(path):
+        try:
+            _reveal_path(path)
+            return
+        except Exception:
+            pass
+    show_toast("That cleaned file is no longer there", "warning")
+
+
 def _render_history():
+    """Render newest-first, single-line entries; long entries are clipped, never wrapped."""
     t = hist_text
     t.configure(state="normal")
     t.delete("1.0", "end")
+    for name in t.tag_names():
+        if name.startswith("hist"):
+            t.tag_configure(name, underline=False)
+    t.configure(cursor="arrow")
+
     if not app.history:
         t.insert("end", "No runs yet — finished runs will be listed here.", "muted")
     else:
-        last = len(app.history) - 1
+        scale = widget_scale(t)
+        font = tkfont.Font(root=app, family="Segoe UI", size=-int(round(11 * scale)))
+        # The scrollbar occupies its own column, so only the text widget's inner width is relevant.
+        available = max(t.winfo_width() - px(26, t), px(40, t))
         for i, e in enumerate(app.history):
-            icon, tag = _HIST_ICONS[e["status"]]
-            t.insert("end", icon + "  ", tag)
-            parts = [e["time"]]
-            if e["status"] in ("ok", "warn"):
-                parts += [short_duration(e["elapsed"]), f"{e['rows']:,} rows"]
-                if e["warns"]:
-                    parts.append(f"{e['warns']} warning{'s' if e['warns'] != 1 else ''}")
-            elif e["status"] == "err":
-                parts.append("failed")
+            icon, status_tag = _HIST_ICONS[e["status"]]
+            clickable = e["status"] in ("ok", "warn") and bool(e.get("output"))
+            if clickable:
+                tag_name = f"hist{i}"
+                t.tag_configure(tag_name, underline=False)
+                t.tag_bind(tag_name, "<Button-1>", lambda ev, p=e["output"]: _open_history_file(p))
+                t.tag_bind(tag_name, "<Enter>", lambda ev, n=tag_name: _hist_hover(n, True))
+                t.tag_bind(tag_name, "<Leave>", lambda ev, n=tag_name: _hist_hover(n, False))
             else:
-                parts.append("cancelled")
-            parts += [e["cleaner"], e["file"]]
-            t.insert("end", "  ·  ".join(parts) + ("\n" if i < last else ""), "rest")
+                tag_name = None
+
+            if e["status"] in ("ok", "warn"):
+                details = "  ·  ".join((e["time"], short_duration(e["elapsed"]),
+                                        f"{int(e['rows'] or 0):,} rows", e["cleaner"],
+                                        e.get("output_name") or "(output name unavailable)"))
+            elif e["status"] == "err":
+                details = "  ·  ".join((e["time"], "failed", e["cleaner"]))
+            else:
+                details = "  ·  ".join((e["time"], "cancelled", e["cleaner"]))
+            details = _ellipsize(details, font, available - font.measure(icon + "  "))
+            row_start = t.index("end-1c")
+            t.insert("end", icon + "  ", status_tag)
+            t.insert("end", details, "rest")
+            if tag_name:
+                t.tag_add(tag_name, row_start, "end-1c")
+            if i < len(app.history) - 1:
+                t.insert("end", "\n")
+
     t.configure(state="disabled")
+    if len(app.history) > 3:
+        hist_scroll.grid()
+    else:
+        hist_scroll.grid_remove()
     t.yview_moveto(0)
 
 
-def add_history(status, file_name, cleaner, rows=None, elapsed=None, warns=0):
-    """Records one run (newest first) in the session strip."""
-    app.history.insert(0, {"status": status, "file": file_name, "cleaner": cleaner, "rows": rows,
-                           "elapsed": elapsed, "warns": warns,
+def add_history(status, file_name, cleaner, rows=None, elapsed=None, warns=0, output=None):
+    """Records one run (newest first); only the cleaned output name is shown in history."""
+    app.history.insert(0, {"status": status, "cleaner": cleaner, "rows": rows,
+                           "elapsed": elapsed, "warns": warns, "output": output,
+                           "output_name": Path(output).name if output else None,
                            "time": datetime.datetime.now().strftime("%I:%M %p").lstrip("0")})
     del app.history[HISTORY_MAX:]
     _render_history()
@@ -1424,7 +1796,7 @@ def handle_success(row_count, output_path, elapsed_seconds, button, base_text, d
     open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
     refresh_steps()
     add_history("warn" if warn_count else "ok", _current_file_name(), base_text,
-                rows=int(row_count), elapsed=elapsed_seconds, warns=warn_count)
+                rows=int(row_count), elapsed=elapsed_seconds, warns=warn_count, output=output_path)
     notify_done("warning" if warn_count else "success", elapsed_seconds)
 
 
@@ -1507,7 +1879,7 @@ def _render_file_label(count_text, pending=False):
     text = f"{name}  •  {size_text}"
     if parts:
         text += "\n" + "  ·  ".join(parts)
-    file_label.configure(text=text, text_color=SUCCESS_COLOR)
+    set_clamped_text(file_label, "file", text, 11, 2, para_lines=1, text_color=SUCCESS_COLOR)
 
 
 def _start_file_info(filename):
@@ -1551,12 +1923,12 @@ def process_selected_file(filename):
             _start_file_info(filename)
         else:
             app._info_token = None
-        upload_card.configure(border_color=FILE_LOADED_BORDER, border_width=1)
         app.selected_path = filename
+        _refresh_upload_border()
         app.run_done = False
         clear_btn.grid(row=0, column=2, padx=(5, 15))
 
-        set_cleaners_enabled(True)
+        set_cleaners_enabled(True, stagger=True)
 
         CONFIG["last_dir"] = str(Path(filename).parent)
         save_config(CONFIG)
@@ -1588,9 +1960,9 @@ def clear_file():
     app.selected_path = None
     app._info_token = None
     app.run_done = False
-    file_label.configure(text=FILE_PLACEHOLDER, text_color=MUTED_TEXT)
-    upload_card.configure(border_color=BORDER_COLOR, border_width=1)
+    set_clamped_text(file_label, "file", FILE_PLACEHOLDER, 11, 2, text_color=MUTED_TEXT)
     clear_btn.grid_forget()
+    _refresh_upload_border()
 
     set_cleaners_enabled(False)
     if not getattr(app, 'last_output_path', None):
@@ -1628,7 +2000,9 @@ def _reveal_path(path):
     """Opens the file's folder with the file highlighted (Explorer / Finder)."""
     path = str(path)
     if sys.platform == "win32":
-        subprocess.Popen(["explorer", f"/select,{os.path.normpath(path)}"])
+        # Passed as ONE string with the path quoted: as a list, subprocess wraps the whole "/select,..." argument
+        # in quotes, and Explorer then ignores it (it opens Documents) whenever the path contains a space.
+        subprocess.Popen(f'explorer /select,"{os.path.normpath(path)}"')
     elif sys.platform == "darwin":
         subprocess.Popen(["open", "-R", path])
     else:
@@ -1668,7 +2042,7 @@ def copy_log():
         content = status_box.get("1.0", "end-1c")
         app.clipboard_clear()
         app.clipboard_append(content)
-        log_message("Activity log copied to clipboard.")
+        show_toast("Activity log copied to clipboard", "success")
     except Exception as e:
         log_message(f"Error copying activity log: {e}")
 
@@ -1688,17 +2062,45 @@ def save_log():
             return
         with open(path, "w", encoding="utf-8") as f:
             f.write(content + "\n")
-        log_message(f"Saved activity log to: {Path(path).name}")
+        show_toast(f"Log saved: {Path(path).name}", "success")
     except Exception as e:
         log_message(f"Error saving activity log: {e}")
 
 
+def _show_dialog_settled(dialog, w_u, h_u):
+    """Centres the dialog over the window at its final size and shows it in one step. The UI scale is the same on
+    every monitor, so there is nothing to wait for or re-fit."""
+    app.update_idletasks()
+    s_ = widget_scale(app)
+    x = app.winfo_x() + (app.winfo_width() - int(w_u * s_)) // 2
+    y = app.winfo_y() + (app.winfo_height() - int(h_u * s_)) // 2
+    try:
+        dialog.geometry(f"{w_u}x{h_u}+{x}+{y}")
+        dialog.update_idletasks()
+    except Exception:
+        pass
+    try:
+        dialog.deiconify()
+        tk.Wm.wm_attributes(dialog, "-alpha", 1.0)
+        dialog.lift()
+        dialog.focus_force()
+    except Exception:
+        pass
+
+
 def custom_askyesno(title, message, allow_remember=True):
     """Modal confirmation. Enter = Yes, Esc = No. Optionally offers 'don't ask again this session'."""
+    if getattr(app, "_dialog_open", False):
+        return False
+    app._dialog_open = True
     dialog = ctk.CTkToplevel(app)
+    dialog.withdraw()                                     # built invisibly, shown by _show_dialog_settled
+    try:
+        tk.Wm.wm_attributes(dialog, "-alpha", 0.0)
+    except Exception:
+        pass
     dialog.title(title)
     dialog_width, dialog_height = 400, (232 if allow_remember else 214)
-    dialog.geometry(f"{dialog_width}x{dialog_height}")
     dialog.resizable(False, False)
     dialog.configure(fg_color=NAVY_BLUE)
 
@@ -1709,14 +2111,6 @@ def custom_askyesno(title, message, allow_remember=True):
         pass
 
     dialog.transient(app)
-    dialog.grab_set()
-
-    app.update_idletasks()
-    dialog.update_idletasks()
-    scale = widget_scale(app)
-    x = app.winfo_x() + (app.winfo_width() - int(dialog_width * scale)) // 2
-    y = app.winfo_y() + (app.winfo_height() - int(dialog_height * scale)) // 2
-    dialog.geometry(f"{dialog_width}x{dialog_height}+{max(x, 0)}+{max(y, 0)}")
 
     result = [False]
     closed = [False]
@@ -1767,7 +2161,15 @@ def custom_askyesno(title, message, allow_remember=True):
     except Exception:
         pass
 
-    dialog.wait_window()
+    _show_dialog_settled(dialog, dialog_width, dialog_height)
+    try:
+        dialog.grab_set()                                 # needs a visible window, so only after it is shown
+    except Exception:
+        pass
+    try:
+        dialog.wait_window()
+    finally:
+        app._dialog_open = False
     if result[0] and allow_remember and remember.get():
         app.skip_confirm = True
         log_message("Confirmations turned off for this session.")
@@ -1776,7 +2178,7 @@ def custom_askyesno(title, message, allow_remember=True):
 
 def start_cleaner(c):
     """Confirms (unless turned off) and starts the chosen cleaner."""
-    if getattr(app, "is_processing", False):
+    if getattr(app, "is_processing", False) or getattr(app, "_dialog_open", False):
         return
     if not getattr(app, "selected_path", None):
         log_message("Warning: Please upload a retail file before running the cleaner.")
@@ -1808,7 +2210,7 @@ class LoadingSplash(tk.Toplevel):
     """
     W, H = 400, 180  # unscaled units
 
-    def __init__(self, master):
+    def __init__(self, master, center=None):
         super().__init__(master)
         self.withdraw()
         self.overrideredirect(True)
@@ -1822,9 +2224,12 @@ class LoadingSplash(tk.Toplevel):
             return px(value, master)
 
         w, h = s(self.W), s(self.H)
-        x = (self.winfo_screenwidth() - w) // 2
-        y = (self.winfo_screenheight() - h) // 2 - s(20)
-        self.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
+        if center:                                   # same screen as the window will open on
+            x, y = center[0] - w // 2, center[1] - h // 2 - s(20)
+        else:
+            x = (self.winfo_screenwidth() - w) // 2
+            y = (self.winfo_screenheight() - h) // 2 - s(20)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
         cw = w - 2
         self._canvas = tk.Canvas(self, bg=NAVY_BLUE, highlightthickness=0, bd=0)
@@ -1857,6 +2262,12 @@ class LoadingSplash(tk.Toplevel):
         except Exception:
             pass
 
+    def set_alpha(self, alpha):
+        try:
+            self.attributes("-alpha", max(0.0, min(1.0, alpha)))
+        except Exception:
+            pass
+
     def close(self):
         try:
             self.destroy()
@@ -1872,6 +2283,7 @@ FILE_PLACEHOLDER = "Click here to choose an Excel or CSV file  (Ctrl+O)"
 if __name__ == "__main__":
     multiprocessing.freeze_support()
 
+    lock_fixed_scale()
     app = ctk.CTk()
 
     # Keep the real window invisible while the UI is built. It stays fully "alive" (mapped, measurable),
@@ -1880,8 +2292,24 @@ if __name__ == "__main__":
         app.attributes("-alpha", 0.0)
     except Exception:
         pass
+
+    def _saved_window_center():
+        """Centre of the spot where the window will open (its saved position), so the loading window shows on the
+        same screen. None on first launch or when that spot is no longer on any monitor."""
+        try:
+            saved = load_config().get("window")
+            s_ = widget_scale(app)
+            cx = int(saved["x"]) + FIXED_WIDTH * s_ / 2
+            cy = int(saved["y"]) + int(saved.get("h", 700)) * s_ / 2
+            vx, vy = app.winfo_vrootx(), app.winfo_vrooty()
+            if vx <= cx <= vx + app.winfo_vrootwidth() and vy <= cy <= vy + app.winfo_vrootheight():
+                return int(cx), int(cy)
+        except Exception:
+            pass
+        return None
+
     try:
-        splash = LoadingSplash(app)
+        splash = LoadingSplash(app, center=_saved_window_center())
     except Exception:
         splash = None
 
@@ -1962,6 +2390,7 @@ if __name__ == "__main__":
     file_label = ctk.CTkLabel(upload_card, text=FILE_PLACEHOLDER, font=("Segoe UI", 11),
                               text_color=MUTED_TEXT, anchor="w", justify="left", wraplength=200)
     file_label.grid(row=0, column=1, sticky="ew", padx=10)
+    _clamped["file"] = (file_label, FILE_PLACEHOLDER, 11, 2, None, {})
     file_label.bind("<Button-1>", upload_file)  # the whole label is a big click target
     try:
         file_label._label.configure(cursor="hand2")
@@ -1970,6 +2399,46 @@ if __name__ == "__main__":
 
     clear_btn = ctk.CTkButton(upload_card, text="×", font=("Segoe UI", 17, "bold"), fg_color=SURFACE_BG, hover_color=CLOSE_HOVER,
                               text_color=WHITE, corner_radius=7, width=34, height=34, command=clear_file)
+
+    # The whole card is a click target: it lights up under the pointer and a click opens the file dialog.
+    _upload_fx = {"cur": BORDER_COLOR, "goal": None, "hover": False}
+
+    def _refresh_upload_border():
+        """Fades the card border toward its resting colour (grey / green when a file is loaded) or its hover colour."""
+        base = FILE_LOADED_BORDER if getattr(app, "selected_path", None) else BORDER_COLOR
+        goal = _mix(base, HOVER_ORANGE, 0.75) if _upload_fx["hover"] else base
+        if goal == _upload_fx["goal"]:
+            return
+        _upload_fx["goal"] = goal
+        start = _upload_fx["cur"]
+
+        def step(t):
+            _upload_fx["cur"] = _mix(start, goal, t)
+            upload_card.configure(border_color=_upload_fx["cur"])
+
+        animate("upload_border", 160, step)
+
+    def _upload_hover_check(_event=None):
+        def check():
+            try:
+                x, y = app.winfo_pointerxy()
+                rx, ry = upload_card.winfo_rootx(), upload_card.winfo_rooty()
+                inside = rx <= x < rx + upload_card.winfo_width() and ry <= y < ry + upload_card.winfo_height()
+            except Exception:
+                inside = False
+            if inside != _upload_fx["hover"]:
+                _upload_fx["hover"] = inside
+                _refresh_upload_border()
+        app.after(12, check)  # let Tk settle Enter/Leave between the card and its children first
+
+    for _w in (upload_card, file_label, upload_btn, clear_btn):
+        _w.bind("<Enter>", _upload_hover_check, add="+")
+        _w.bind("<Leave>", _upload_hover_check, add="+")
+    upload_card.bind("<Button-1>", upload_file, add="+")
+    try:
+        upload_card.configure(cursor="hand2")
+    except Exception:
+        pass
 
     # Step 2 - choose cleaner
     step2_row, step2_badge, step2_title, step2_hint = make_step_row(left_col, 2, "CHOOSE A CLEANER")
@@ -2013,9 +2482,11 @@ if __name__ == "__main__":
     ]
     for _c in CLEANERS:
         _c["btn"].configure(command=lambda c=_c: start_cleaner(c))
+    for _i, _c in enumerate(CLEANERS):
+        _c["btn"].set_keycap(str(_i + 1))      # the 1-5 shortcut, shown on the button itself
 
     # One-line description of whichever cleaner the pointer (or keyboard focus) is on.
-    DESC_DEFAULT = f"Hover over a cleaner to see what it is for.  Press 1–{len(CLEANERS)} to run one."
+    DESC_DEFAULT = "Hover over a cleaner to see what it is for."   # the 1–5 keys are on the buttons and in the footer
     # The label sits in a frame whose height is reserved for the LONGEST description at the current width
     # (see _fit_desc_box), so hovering from button to button can never resize or reflow the window.
     desc_frame = ctk.CTkFrame(left_col, fg_color="transparent", height=32)
@@ -2045,6 +2516,7 @@ if __name__ == "__main__":
     live_status_banner = ctk.CTkLabel(operation_card, text="Ready — start by selecting a retail file.", font=("Segoe UI", 11),
                                       text_color=MUTED_TEXT, anchor="w", justify="left", wraplength=300, height=34)
     live_status_banner.grid(row=0, column=0, sticky="ew", padx=14, pady=(8, 2))
+    _clamped["banner"] = (live_status_banner, "Ready — start by selecting a retail file.", 11, 2, None, {})
 
     cancel_btn = ctk.CTkButton(operation_card, text="Cancel", font=("Segoe UI", 11, "bold"), fg_color=CANCEL_COLOR,
                                hover_color=CANCEL_HOVER, text_color=WHITE, corner_radius=7, height=32, width=92,
@@ -2078,21 +2550,30 @@ if __name__ == "__main__":
                                      command=open_destination_folder, bg=NAVY_BLUE)
     open_folder_btn.grid(row=0, column=1, sticky="ew", padx=(px(6), 0))
 
-    # Session strip: one-line totals plus the most recent runs (scroll for older ones)
+    # Session history sits immediately below the review-results controls and has a fixed three-row viewport.
     stats_card = ctk.CTkFrame(left_col, fg_color=CARD_BG, corner_radius=10, border_width=1, border_color=BORDER_COLOR)
-    stats_card.pack(fill="x")
+    stats_card.pack(fill="x", pady=(0, 0))
 
     hist_head = ctk.CTkFrame(stats_card, fg_color="transparent")
-    hist_head.pack(fill="x", padx=12, pady=(8, 3))
+    hist_head.pack(fill="x", padx=12, pady=(7, 2))
     ctk.CTkLabel(hist_head, text="THIS SESSION", font=("Segoe UI", 9, "bold"), text_color=MUTED_TEXT).pack(side="left")
     session_summary = ctk.CTkLabel(hist_head, text="No files cleaned yet", font=("Segoe UI", 10, "bold"),
                                    text_color=INFO_COLOR, anchor="e")
     session_summary.pack(side="right")
 
-    # A raw Tk text keeps the history light; its font is rescaled with the DPI like the other raw pieces.
-    hist_text = tk.Text(stats_card, height=3, bg=CARD_BG, fg=LOG_TEXT, bd=0, highlightthickness=0, wrap="none",
+    hist_body = ctk.CTkFrame(stats_card, fg_color="transparent")
+    hist_body.pack(fill="x", padx=12, pady=(0, 7))
+    hist_body.grid_columnconfigure(0, weight=1)
+    hist_text = tk.Text(hist_body, height=3, bg=CARD_BG, fg=LOG_TEXT, bd=0, highlightthickness=0, wrap="none",
                         cursor="arrow", font=("Segoe UI", -px(11)), padx=0, pady=1, takefocus=0, state="disabled")
-    hist_text.pack(fill="x", padx=12, pady=(0, 8))
+    hist_text.grid(row=0, column=0, sticky="ew")
+    hist_scroll = tk.Scrollbar(hist_body, orient="vertical", command=hist_text.yview, width=px(8, hist_body),
+                               bd=0, highlightthickness=0, relief="flat", bg=CARD_BG, troughcolor=CARD_BG,
+                               activebackground=SURFACE_BG)
+    hist_scroll.grid(row=0, column=1, sticky="ns", padx=(px(5, hist_body), 0))
+    hist_text.configure(yscrollcommand=hist_scroll.set)
+    hist_text.bind("<MouseWheel>", lambda e: hist_text.yview_scroll(int(-1 * (e.delta / 120)), "units"))
+    hist_text.bind("<Configure>", lambda e: app.after_idle(_render_history))
     hist_text.tag_configure("ok", foreground=SUCCESS_COLOR)
     hist_text.tag_configure("warn", foreground=WARNING_COLOR)
     hist_text.tag_configure("err", foreground=ERROR_COLOR)
@@ -2107,6 +2588,8 @@ if __name__ == "__main__":
     _splash_step("Building activity log…", 0.72)
     log_col.grid_columnconfigure(0, weight=1)
     log_col.grid_rowconfigure(1, weight=1)
+    # The log never dictates its own size: whatever it holds (long lines, a scrollbar appearing) stays inside it.
+    log_col.grid_propagate(False)
 
     log_header = ctk.CTkFrame(log_col, fg_color="transparent")
     log_header.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -2130,7 +2613,7 @@ if __name__ == "__main__":
     save_log_btn = _log_button("Save", save_log, (0, 6))
     clear_log_btn = _log_button("Clear", clear_log, 0)
 
-    # Second row: level filter + a badge that jumps to warnings (shown only when there are some)
+    # Second row: level filter (the Warnings button carries the warning count)
     log_tools = ctk.CTkFrame(log_header, fg_color="transparent")
     log_tools.pack(fill="x", pady=(6, 0))
 
@@ -2142,10 +2625,6 @@ if __name__ == "__main__":
     log_filter.set("All")
     log_filter.pack(side="left")
 
-    warn_badge = ctk.CTkButton(log_tools, text="", font=("Segoe UI", 10, "bold"), fg_color="#3A2E0C", hover_color="#4D3C0F",
-                               text_color=WARNING_COLOR, border_width=1, border_color="#8A6A12", corner_radius=6,
-                               height=24, width=96, command=jump_to_warning)  # packed by _refresh_warn_badge
-
     status_box = ctk.CTkTextbox(log_col, height=LOG_MIN_HEIGHT, corner_radius=9, fg_color=LOG_BG, text_color=LOG_TEXT,
                                 font=("Consolas", 11), border_width=1, border_color=BORDER_COLOR, wrap="word")
     status_box.grid(row=1, column=0, sticky="nsew")
@@ -2156,6 +2635,8 @@ if __name__ == "__main__":
     status_box._textbox.tag_config("error", foreground=ERROR_COLOR)
     status_box._textbox.tag_config("notice", foreground=WARNING_COLOR)
     status_box._textbox.tag_config("processing", foreground=INFO_COLOR)
+    status_box._textbox.tag_config("fresh", background=LOG_BG)  # the newest line fades out of a soft highlight
+    status_box._textbox.tag_config("stamp", foreground=LOG_STAMP)  # muted [time] prefix (created after the level tags so it wins)
     status_box._textbox.tag_config("flash", background="#3B2F0B")  # brief highlight when jumping to a warning
 
     status_box.insert("end", "[System] Application ready. Browse a retail file to begin.\n", "normal")
@@ -2175,7 +2656,7 @@ if __name__ == "__main__":
     # ======================================================================
     # Responsive layout engine
     # ======================================================================
-    _splash_step("Fitting to your screen…", 0.88)
+    _splash_step("Laying out…", 0.88)
     _layout = {"mode": None, "cols": None, "stacked_footer": None, "wrap": {}, "compact": False,
                "main_pady": MAIN_PADY, "auto_compact": True, "dual_w": None,
                "scale": None, "settle_until": 0.0, "scale_job": None}
@@ -2260,15 +2741,18 @@ if __name__ == "__main__":
             return
         _layout["mode"] = mode
         if mode == "dual":
-            main_frame.grid_columnconfigure(0, weight=3, minsize=px(MIN_LEFT))
-            main_frame.grid_columnconfigure(1, weight=2, minsize=px(MIN_RIGHT))
+            # "uniform" makes the two columns exactly 3 : 2 of the window, whatever their contents ask for. Without
+            # it a column's width followed its content (a log scrollbar appearing, a long line), and the other
+            # column, and everything in it, shifted to compensate.
+            main_frame.grid_columnconfigure(0, weight=3, minsize=px(MIN_LEFT), uniform="panes")
+            main_frame.grid_columnconfigure(1, weight=2, minsize=px(MIN_RIGHT), uniform="panes")
             main_frame.grid_rowconfigure(1, weight=1)
             main_frame.grid_rowconfigure(2, weight=0, minsize=0)
             left_col.grid(row=1, column=0, columnspan=1, sticky="nsew", padx=(0, PANE_GAP // 2), pady=(0, 0))
             log_col.grid(row=1, column=1, columnspan=1, sticky="nsew", padx=(PANE_GAP // 2, 0), pady=(0, 0))
         else:
-            main_frame.grid_columnconfigure(0, weight=1, minsize=0)
-            main_frame.grid_columnconfigure(1, weight=0, minsize=0)
+            main_frame.grid_columnconfigure(0, weight=1, minsize=0, uniform="")
+            main_frame.grid_columnconfigure(1, weight=0, minsize=0, uniform="")
             main_frame.grid_rowconfigure(1, weight=0)
             main_frame.grid_rowconfigure(2, weight=1, minsize=px(LOG_ROW_MIN))
             left_col.grid(row=1, column=0, columnspan=2, sticky="new", padx=0, pady=(0, 12))
@@ -2295,29 +2779,6 @@ if __name__ == "__main__":
         """Height (unscaled) the content needs in order to show everything."""
         app.update_idletasks()
         return main_frame.winfo_reqheight() / widget_scale(app) + 2 * _layout["main_pady"] + 2
-
-    def _avail_height_u():
-        """Usable window height (unscaled) on the monitor the window is on, after taskbar + title bar."""
-        work = _monitor_work_height_px()
-        if work:
-            return (work - TITLEBAR_RESERVE_PX) / widget_scale(app)
-        return (app.winfo_screenheight() - SCREEN_RESERVE_PX) / widget_scale(app)
-
-    def update_min_size():
-        """Keeps the minimum window size in sync with what the content really needs."""
-        global _min_height
-        scale = widget_scale(app)
-        avail = _avail_height_u()
-        need = _need_height_u()
-        if _layout["auto_compact"] and not _layout["compact"] and need > avail:
-            set_density(True)
-            need = _need_height_u()
-        need_h = int(min(need, avail))
-        if need_h != _min_height:
-            _min_height = need_h
-            app.minsize(MIN_WIDTH, need_h)
-        if app.winfo_height() > 1 and app.winfo_height() / scale < need_h - 1:
-            app.geometry(f"{int(app.winfo_width() / scale)}x{need_h}")
 
     def apply_layout(width_u=None):
         """Reflows the UI for the current width. Control sizes stay fixed; layout adapts around them."""
@@ -2355,9 +2816,10 @@ if __name__ == "__main__":
         _set_wrap(live_status_banner, "banner", col_w - 154)
         _set_wrap(cleaner_desc, "desc", col_w - 8)
         _fit_desc_box(_layout["wrap"]["desc"])
+        for _k in ("banner", "file"):          # re-cut the fixed-height texts for the new width / DPI
+            if _k in _clamped:
+                _render_clamped(_k)
 
-        # 5) Keep the minimum size in sync with whatever the layout now needs
-        update_min_size()
 
     def schedule_layout():
         """
@@ -2384,156 +2846,25 @@ if __name__ == "__main__":
     app.bind("<Configure>", _on_app_configure, add="+")
 
     # ======================================================================
-    # Moving the window to a monitor with a different DPI scale
-    # CustomTkinter rescales its own widgets, but the gradient buttons, the header, the progress bar and
-    # every px()-based padding are raw Tk pieces that would otherwise keep the old monitor's pixel sizes.
-    # ======================================================================
-    _pixel_widgets = [upload_btn, open_output_btn, open_folder_btn, *cleaner_buttons]
-
-    def _apply_scaled_paddings():
-        compact = _layout["compact"]
-        header_banner.grid_configure(pady=(0, px(10 if compact else 16)))
-        upload_btn.grid_configure(padx=px(14), pady=px(8 if compact else 14))
-        open_output_btn.grid_configure(padx=(0, px(6)))
-        open_folder_btn.grid_configure(padx=(px(6), 0))
-        progress.grid_configure(padx=px(14), pady=(0, px(10)))
-        hist_text.configure(font=("Segoe UI", -px(11)))
-        _layout["cols"] = None  # rebuilds the cleaner grid (and its px() gaps) on the next layout pass
-
-    def _refit_after_move(step=0):
-        """
-        Re-fits the layout after the window lands on another monitor. Run a few times on purpose: right after
-        the move CustomTkinter is still rescaling its widgets, so a single pass can measure half-updated sizes
-        and leave the log or footer clipped (which a manual full-screen toggle used to fix).
-        """
-        _layout["refit_job"] = None
-        try:
-            _layout["mode"] = None       # grid minsizes are px() values of the old scale: rebuild them
-            _layout["cols"] = None
-            _layout["desc_key"] = None
-            _layout["wrap"].clear()
-            if _layout["compact"]:       # the new monitor may have room again; update_min_size re-compacts if not
-                set_density(False)
-            apply_layout()
-
-            app.update_idletasks()
-            scale = widget_scale(app)
-            win_bottom = app.winfo_rooty() + app.winfo_height()
-            footer_bottom = footer_frame.winfo_rooty() + footer_frame.winfo_height()
-            if footer_bottom > win_bottom + 1 or status_box.winfo_height() < px(60):
-                if not _layout["compact"]:
-                    set_density(True)
-                height = int(min(_need_height_u(), _avail_height_u()))
-                app.geometry(f"{int(app.winfo_width() / scale)}x{height}")
-            if step < 2:
-                _layout["refit_job"] = app.after((900, 1800)[step], lambda: _refit_after_move(step + 1))
-        except Exception:
-            pass
-
-    def _schedule_refit():
-        job = _layout.get("refit_job")
-        if job is not None:
-            try:
-                app.after_cancel(job)
-            except Exception:
-                pass
-        _layout["refit_job"] = app.after(350, _refit_after_move)
-
-    def _check_scale():
-        """Cheap 120 ms watcher: when the DPI scale changes, refresh the raw-canvas pieces once, then re-layout."""
-        _layout["scale_job"] = None
-        try:
-            scale = widget_scale(app)
-            known = _layout["scale"]
-            if known is None:
-                _layout["scale"] = scale
-            elif abs(scale - known) > 0.001:
-                _layout["scale"] = scale
-                _layout["settle_until"] = time.monotonic() + SCALE_SETTLE_MS / 1000.0
-                for w in _pixel_widgets:
-                    w.rescale()
-                progress.rescale()
-                _apply_scaled_paddings()
-                header_banner.refresh()
-                schedule_layout()
-                _schedule_refit()
-            # Same DPI scale but a different monitor (e.g. a bigger one): refit as well.
-            work = _monitor_work_height_px()
-            if work is not None:
-                if _layout.get("work_h") not in (None, work):
-                    _schedule_refit()
-                _layout["work_h"] = work
-        except Exception:
-            pass
-        try:
-            _layout["scale_job"] = app.after(120, _check_scale)
-        except Exception:
-            pass
-
-    # ======================================================================
     # Guaranteed fit on spawn
     # ======================================================================
     def fit_and_place():
-        """
-        Picks the first layout that fully fits this screen, then sizes + centers the window:
-          1) single column  ->  2) two panes (log on the right)  ->  3) two panes, compact
-          ->  4) single column, compact
-        """
+        """One fixed window for every monitor: the same width, the same height and the same spacing everywhere.
+        Nothing here depends on the screen except where the window is centred on a first launch."""
         app.update_idletasks()
         scale = widget_scale(app)
-        sw_u = app.winfo_screenwidth() / scale
-        sh_u = app.winfo_screenheight() / scale
-        avail = _avail_height_u()
-
-        single_w = 760
-        dual_w = int(min(sw_u * 0.82, 1240))
-        _layout["dual_w"] = dual_w if dual_w >= DUAL_BREAKPOINT + 20 else None
-        candidates = [(single_w, False)]
-        if _layout["dual_w"]:
-            candidates += [(dual_w, False), (dual_w, True)]
-        candidates.append((single_w, True))
-
+        _layout["dual_w"] = _layout["fixed_w"] = FIXED_WIDTH
         _layout["auto_compact"] = False
-        chosen, need = candidates[-1], None
-        for width, compact in candidates:
-            set_density(compact)
-            apply_layout(width_u=width)
-            need = _need_height_u()
-            chosen = (width, compact)
-            if need <= avail:
-                break
+        set_density(True)
+        apply_layout(width_u=FIXED_WIDTH)
         _layout["auto_compact"] = True
-
-        width, _ = chosen
-        roomy = max(need + 80, sh_u * 0.80) if width == single_w else need + 24
-        height = int(max(min(avail, roomy, 880), min(need, avail)))
-        x = int((app.winfo_screenwidth() - width * scale) / 2)
+        height = int(_need_height_u() + 8)
+        _layout["fixed_h"] = height
+        x = int((app.winfo_screenwidth() - FIXED_WIDTH * scale) / 2)
         y = int((app.winfo_screenheight() - height * scale - 40) / 2)
-        app.geometry(f"{width}x{height}+{max(x, 0)}+{max(y, 0)}")
-        app.after(350, verify_fit)
-
-    def verify_fit(attempt=0):
-        """After the window is on screen: confirm the footer and log are visible, escalating if they are not."""
+        app.geometry(f"{FIXED_WIDTH}x{height}+{max(x, 0)}+{max(y, 0)}")
         try:
-            app.update_idletasks()
-            scale = widget_scale(app)
-            win_bottom = app.winfo_rooty() + app.winfo_height()
-            footer_bottom = footer_frame.winfo_rooty() + footer_frame.winfo_height()
-            clipped = footer_bottom > win_bottom + 1 or status_box.winfo_height() < px(60)
-
-            screen_h = app.winfo_screenheight()
-            if win_bottom > screen_h - 8:  # window hangs off the bottom of the screen: nudge it up
-                app.geometry(f"+{max(app.winfo_x(), 0)}+{max(0, screen_h - app.winfo_height() - 56)}")
-
-            if clipped and attempt < 3:
-                if attempt == 0 and not _layout["compact"]:
-                    set_density(True)
-                    update_min_size()
-                elif attempt <= 1 and _layout["mode"] == "single" and _layout["dual_w"]:
-                    app.geometry(f"{_layout['dual_w']}x{int(app.winfo_height() / scale)}")
-                else:
-                    status_box.configure(height=60)
-                app.after(350, lambda: verify_fit(attempt + 1))
+            app.resizable(False, False)
         except Exception:
             pass
 
@@ -2587,13 +2918,28 @@ if __name__ == "__main__":
         scale = widget_scale(app)
         vx, vy = app.winfo_vrootx(), app.winfo_vrooty()
         vw, vh = app.winfo_vrootwidth(), app.winfo_vrootheight()
+        if _layout.get("fixed_w"):
+            # The size is fixed and was fitted to this screen, so only the position is restored (kept on screen).
+            cur_w, cur_h = app.winfo_width(), app.winfo_height()
+            if min(x + cur_w, vx + vw) - max(x, vx) < 160 or not (vy - 10 <= y <= vy + vh - 80):
+                return
+            y = max(vy, min(y, vy + vh - cur_h - 48))
+            tk.Wm.wm_geometry(app, f"+{x}+{y}")
+            app.update_idletasks()
+            return
         pw = w * scale
         visible_w = min(x + pw, vx + vw) - max(x, vx)
         if visible_w < 160 or not (vy - 10 <= y <= vy + vh - 80):
             return
+        if _layout.get("fixed_w"):       # fixed-size window: only the position is remembered
+            tk.Wm.wm_geometry(app, f"+{x}+{y}")
+            app.update_idletasks()
+            return
         min_w, min_h = tk.Wm.wm_minsize(app)
         w = int(max(min(w, (vw - 40) / scale), min_w / scale))
         h = int(max(min(h, (vh - 80) / scale), min_h / scale))
+        if _layout.get("fixed_w"):
+            w = _layout["fixed_w"]            # an older saved width must not override the fixed one
         app.geometry(f"{w}x{h}+{x}+{y}")
         app.update_idletasks()
 
@@ -2603,6 +2949,8 @@ if __name__ == "__main__":
         try:
             if _layout["scale_job"] is not None:
                 app.after_cancel(_layout["scale_job"])
+            if _anim["job"] is not None:
+                app.after_cancel(_anim["job"])
             _stop_worker()
         finally:
             app.destroy()
@@ -2613,14 +2961,90 @@ if __name__ == "__main__":
     # Start
     # ======================================================================
     def _reveal_app():
-        """One-step handover: the finished, fully laid-out window appears and the splash goes away."""
+        """Handover: the finished, fully laid-out window fades in while the loading screen fades out.
+        Set FADE_IN_MS = 0 for an instant swap (a fade re-composites the window on every frame, which can
+        stutter on slow graphics). Animations are switched on only after things settle."""
         try:
-            app.attributes("-alpha", 1.0)
             app.lift()
         except Exception:
             pass
-        if splash is not None:
-            splash.close()
+
+        def _finish():
+            try:
+                app.attributes("-alpha", 1.0)
+            except Exception:
+                pass
+            if splash is not None:
+                splash.close()
+            app.after(400, lambda: _motion.update(on=True))   # state changes animate from here on
+
+        if FADE_IN_MS <= 0:
+            _finish()
+            return
+        t0 = time.perf_counter()
+
+        def _step():
+            t = min(1.0, (time.perf_counter() - t0) * 1000.0 / FADE_IN_MS)
+            e = 1.0 - (1.0 - t) ** 3                          # ease-out
+            try:
+                app.attributes("-alpha", e)
+                if splash is not None:
+                    splash.set_alpha(1.0 - e)
+            except Exception:
+                pass
+            if t < 1.0:
+                app.after(12, _step)
+            else:
+                _finish()
+
+        _step()
+
+    def _settle_hidden(min_ms=400, quiet_ms=300, max_ms=5000):
+        """Pumps the window's deferred work while it is still invisible behind the splash, and only returns
+        once it has really stopped changing: CustomTkinter's DPI rescale (it polls every 100 ms), our own
+        scale/monitor check (every 120 ms) and the refit passes that follow a monitor change. Without this
+        those run after the reveal, and you watch the window re-fit itself to the monitor."""
+        _layout["startup"] = True        # refit passes run back to back instead of 0.35 s / 1.25 s / 3 s apart
+        t0 = time.perf_counter()
+        quiet_since = None
+        # Anything that moves, resizes, hides or re-shows the window (our own refits, CustomTkinter's titlebar
+        # redraw, Windows' own DPI-change handling) lands here and restarts the quiet period.
+        _last_event = {"t": time.perf_counter()}
+
+        def _note_window_event(event):
+            if event.widget is app:
+                _last_event["t"] = time.perf_counter()
+
+        _ids = [(seq, app.bind(seq, _note_window_event, add="+")) for seq in ("<Configure>", "<Map>", "<Unmap>")]
+        try:
+            while True:
+                try:
+                    app.update()
+                except Exception:
+                    break
+                time.sleep(0.008)
+                now = time.perf_counter()
+                busy = (_layout.get("refit_job") is not None
+                        or _resize_job is not None
+                        or time.monotonic() < _layout["settle_until"]
+                        or (now - _last_event["t"]) * 1000.0 < quiet_ms
+                        or abs(widget_scale(app) - (_layout["scale"] or 0)) > 0.001)
+                if busy:
+                    quiet_since = None
+                elif quiet_since is None:
+                    quiet_since = now
+                elapsed_ms = (now - t0) * 1000.0
+                if elapsed_ms >= max_ms:
+                    break
+                if elapsed_ms >= min_ms and quiet_since is not None and (now - quiet_since) * 1000.0 >= quiet_ms:
+                    break
+        finally:
+            _layout["startup"] = False
+            for _seq, _fid in _ids:   # unbind only our handler, not the app's own bindings
+                try:
+                    app.unbind(_seq, _fid)
+                except Exception:
+                    pass
 
     _splash_step("Finishing up…", 0.97)
     refresh_steps()
@@ -2633,8 +3057,12 @@ if __name__ == "__main__":
         restore_window_state()
     except Exception:
         pass
+    if _layout.get("fixed_w"):
+        try:
+            app.resizable(False, False)   # size is fixed (also disables maximize); done while hidden
+        except Exception:
+            pass
     _layout["scale"] = widget_scale(app)
-    _layout["scale_job"] = app.after(120, _check_scale)
     schedule_layout()
 
     # Settle everything while the window is still invisible: realise the final geometry, run the
@@ -2643,15 +3071,34 @@ if __name__ == "__main__":
     try:
         app.update()
         apply_layout()
-        verify_fit()
         app.update_idletasks()
     except Exception:
         pass
+    _splash_step("Almost ready…", 0.99)
+    _settle_hidden()
     _splash_step("Ready", 1.0)
+    try:
+        apply_layout()
+        app.update_idletasks()
+        app.update()          # paint every widget while still invisible, so the first visible frame is complete
+        app.update_idletasks()
+    except Exception:
+        pass
     _reveal_app()
 
     # Optional diagnostics: set STRAT_PERF_LOG=1 to log every moment the UI loop was blocked for 80 ms or more.
     if os.environ.get("STRAT_PERF_LOG"):
+        _rev_t = time.perf_counter()
+
+        def _trace_window(event):
+            if event.widget is app:
+                log_message(f"Perf: +{(time.perf_counter() - _rev_t) * 1000:.0f} ms after reveal: "
+                            f"{event.type.name if hasattr(event.type, 'name') else event.type} "
+                            f"{event.width}x{event.height} scale={widget_scale(app):.2f}")
+
+        app.bind("<Configure>", _trace_window, add="+")
+        app.bind("<Map>", _trace_window, add="+")
+        app.bind("<Unmap>", _trace_window, add="+")
         _beat = {"t": time.perf_counter()}
 
         def _heartbeat():

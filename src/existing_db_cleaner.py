@@ -34,6 +34,9 @@ IGNORED_CUSTOMER_NAMES = {      # shared/placeholder customers: never paired (ed
     "CASH", "CASH CUSTOMER", "POS CUSTOMER",
 }
 
+# Brands the interest step must leave alone (compared ignoring case and extra spaces).
+IGNORED_INTEREST_BRANDS = {"UG INTEREST AMOUNT"}
+
 HEADER_SCAN_ROWS = 50
 MIN_HEADER_MATCHES = 4
 
@@ -671,6 +674,12 @@ def process_existing_database(input_file_path: str, progress=None) -> tuple[int,
         df["BRAND"].str.contains("INTEREST", case=False, na=False) |
         df["LONG_DESCRIPTION"].str.contains("INTEREST", case=False, na=False)
     )
+    # Rows of an ignored brand (e.g. "UG Interest Amount") are never treated as interest lines.
+    ignored_brand = (
+        df["BRAND"].fillna("").astype(str).str.replace(r"\s+", " ", regex=True).str.strip().str.upper()
+        .isin(IGNORED_INTEREST_BRANDS)
+    )
+    interest_mask = interest_mask & ~ignored_brand
 
     if interest_mask.any() and "RECEIPT_NO" in df.columns and "CUSTOMER_NAME" in df.columns:
         keys = ["RECEIPT_NO", "CUSTOMER_NAME"]
