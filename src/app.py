@@ -29,7 +29,7 @@ except ImportError:
     winsound = None
 
 if TYPE_CHECKING:  # never runs; lets PyInstaller discover the cleaner modules that the worker imports by name
-    import cadence_cleaner, brand_performance_cleaner, existing_db_cleaner, current_sales_cleaner, database_cleaner  # noqa: F401
+    import cadence_cleaner, brand_performance_cleaner, existing_db_cleaner, current_sales_cleaner, database_cleaner, meta_ads_cleaner  # noqa: F401
 
 # --- Fix Taskbar Icon Grouping on Windows ---
 try:
@@ -90,6 +90,9 @@ EXISTING_DB_ACCENT = "#F59E0B"
 CURRENT_SALES_COLOR = "#3A2030"
 CURRENT_SALES_HOVER = "#4F2B42"
 CURRENT_SALES_ACCENT = "#F472B6"
+META_ADS_COLOR = "#12303F"
+META_ADS_HOVER = "#1A435A"
+META_ADS_ACCENT = "#38BDF8"
 
 CANCEL_COLOR = "#7F1D1D"
 CANCEL_HOVER = "#991B1B"
@@ -626,7 +629,7 @@ class GradientButton(tk.Canvas):
         self._tween_hover(duration=380)
 
     def set_keycap(self, text):
-        """Shows a small key hint (e.g. the 1-5 shortcut) in the button's right corner."""
+        """Shows a small key hint (e.g. the 1-6 shortcut) in the button's right corner."""
         self._gb_cap = str(text)
         self._gb_cap_key = None
         self._schedule(immediate=True)
@@ -2465,7 +2468,9 @@ if __name__ == "__main__":
                                      border_color=EXISTING_DB_ACCENT, state="disabled", **button_style)
     current_sales_btn = GradientButton(btn_frame, text="Current/Daily Sales Cleaner", fg_color=CURRENT_SALES_COLOR, hover_color=CURRENT_SALES_HOVER,
                                        border_color=CURRENT_SALES_ACCENT, state="disabled", **button_style)
-    cleaner_buttons = [cadence_btn, database_btn, brand_performance_btn, existing_db_btn, current_sales_btn]
+    meta_ads_btn = GradientButton(btn_frame, text="Meta Ads Cleaner", fg_color=META_ADS_COLOR, hover_color=META_ADS_HOVER,
+                                  border_color=META_ADS_ACCENT, state="disabled", **button_style)
+    cleaner_buttons = [cadence_btn, database_btn, brand_performance_btn, existing_db_btn, current_sales_btn, meta_ads_btn]
 
     # The module/function pairs are imported by name inside the worker process.
     CLEANERS = [
@@ -2479,14 +2484,16 @@ if __name__ == "__main__":
          "accent": EXISTING_DB_ACCENT, "module": "existing_db_cleaner", "func": "process_existing_database", "desc": "Re-cleans a database file you already cleaned (reads its DatabaseCleanTable): refreshes month/week/quarter, offsets returns, rolls up interest and accessories."},
         {"btn": current_sales_btn, "label": "Current/Daily Sales Cleaner", "color": CURRENT_SALES_COLOR, "hover": CURRENT_SALES_HOVER,
          "accent": CURRENT_SALES_ACCENT, "module": "current_sales_cleaner", "func": "process_current_sales", "desc": "Current/daily sales export with all-caps store names (e.g. ALTITUDE ALABANG TOWN CENTER). Same cleaning as the Database Cleaner."},
+        {"btn": meta_ads_btn, "label": "Meta Ads Cleaner", "color": META_ADS_COLOR, "hover": META_ADS_HOVER,
+         "accent": META_ADS_ACCENT, "module": "meta_ads_cleaner", "func": "process_meta_ads", "desc": "Meta Ads (Supermetrics) export. Keeps messaging campaigns of recognized stores, standardizes store and brand names, and consolidates cost and messaging conversations per store and brand (Summary + Daily). Removed rows go to the Removal Audit Log."},
     ]
     for _c in CLEANERS:
         _c["btn"].configure(command=lambda c=_c: start_cleaner(c))
     for _i, _c in enumerate(CLEANERS):
-        _c["btn"].set_keycap(str(_i + 1))      # the 1-5 shortcut, shown on the button itself
+        _c["btn"].set_keycap(str(_i + 1))      # the 1-6 shortcut, shown on the button itself
 
     # One-line description of whichever cleaner the pointer (or keyboard focus) is on.
-    DESC_DEFAULT = "Hover over a cleaner to see what it is for."   # the 1–5 keys are on the buttons and in the footer
+    DESC_DEFAULT = "Hover over a cleaner to see what it is for."   # the 1–6 keys are on the buttons and in the footer
     # The label sits in a frame whose height is reserved for the LONGEST description at the current width
     # (see _fit_desc_box), so hovering from button to button can never resize or reflow the window.
     desc_frame = ctk.CTkFrame(left_col, fg_color="transparent", height=32)
