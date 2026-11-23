@@ -94,6 +94,7 @@ STORE_NAME_MAP = {
     "RAP FESTIVAL MALL": "Raptor Festival Mall",
     "RAP SM NORTH EDSA": "Raptor SM North Edsa",
     "RAP GATEWAY MALL": "Raptor Gateway",
+    "RAPTOR GLORIETTA 2": "Raptor Glorietta",
     "RAPTOR GATEWAY": "Raptor Gateway",
     "RAPTOR GRAND CENTRAL": "Raptor Grand Central",
     "RAPTOR SM NORTH EDSA": "Raptor SM North Edsa",
@@ -546,7 +547,7 @@ def remove_customer_sale_return_pairs(df: pd.DataFrame, audit_log: list, price_c
 # =========================================================
 # INTEREST AUDIT (read-only)
 # Records what the interest step did so it can be checked in the "Removal Audit Log" sheet.
-# Nothing here changes the data or the interest calculation.
+# The audit itself is read-only; match_interest_to_sales() decides which receipt each interest line joins.
 # =========================================================
 
 def _receipt_key(frame: pd.DataFrame) -> pd.Series:
@@ -560,12 +561,106 @@ def _sale_sums_by_receipt(frame: pd.DataFrame, price_col: str) -> pd.Series:
     return amounts.groupby(_receipt_key(frame).to_numpy()).sum()
 
 
+INTEREST_MATCH_LABELS = {
+    1: "Receipt + Customer",
+    2: "Store + Customer + Same Date",
+    3: "Store + Customer, Nearest Date",
+    4: "Customer Only, Nearest Date (Other Store)",
+}
+
+
+def _interest_store_key(frame: pd.DataFrame) -> pd.Series:
+    """Store identifier per row: STORE_CODE when filled in, otherwise STORE_NAME."""
+    out = pd.Series("", index=frame.index, dtype=object)
+    if "STORE_NAME" in frame.columns:
+        out = frame["STORE_NAME"].fillna("").astype(str).str.strip().str.upper()
+    if "STORE_CODE" in frame.columns:
+        code = frame["STORE_CODE"].fillna("").astype(str).str.strip().str.upper()
+        out = out.mask(code.ne("") & code.ne("NAN"), code)
+    return out
+
+
+def match_interest_to_sales(interest: pd.DataFrame, main: pd.DataFrame, price_col: str) -> pd.DataFrame:
+    """
+    Finds the sale receipt each interest line belongs to. Tiers are tried in order; the first hit wins:
+      1  same RECEIPT_NO + CUSTOMER_NAME                      (the original rule)
+      2  same store + customer + receipt date                 (receipt numbers differ)
+      3  same store + customer, nearest receipt date
+      4  same customer, nearest receipt date, any store       (last resort so interest is not left unpaired)
+    When several receipts qualify, the closest date wins, then the largest receipt total.
+    Shared/placeholder customers (IGNORED_CUSTOMER_NAMES: blank, WALK-IN, CASH...) only use tier 1 or 2,
+    so their interest is never attached to an unrelated day or store.
+    Returns one row per interest line (same index): TARGET_RECEIPT, TARGET_CUSTOMER, TIER (0 = no match).
+    """
+    def keys(frame):
+        k = pd.DataFrame(index=frame.index)
+        k["rk"] = frame["RECEIPT_NO"].fillna("").astype(str)
+        k["ck"] = frame["CUSTOMER_NAME"].fillna("").astype(str)
+        k["sk"] = _interest_store_key(frame)
+        k["dt"] = (pd.to_datetime(frame["RCPT_DATE"], errors="coerce")
+                   if "RCPT_DATE" in frame.columns else pd.NaT)
+        return k
+
+    mk, ik = keys(main), keys(interest)
+    mk["rcpt"] = main["RECEIPT_NO"]
+    mk["cust"] = main["CUSTOMER_NAME"].fillna("")
+    mk["amt"] = pd.to_numeric(main[price_col], errors="coerce").fillna(0)
+    rec = (mk.groupby(["rk", "ck"], sort=False)
+             .agg(rcpt=("rcpt", "first"), cust=("cust", "first"), sk=("sk", "first"),
+                  dt=("dt", "first"), total=("amt", "sum"))
+             .reset_index())
+    rec["cn"] = rec["ck"].str.strip().str.upper()
+    exact = {(r, c): i for i, (r, c) in enumerate(zip(rec["rk"], rec["ck"]))}
+    by_customer = {cn: grp for cn, grp in rec.groupby("cn", sort=False)}
+
+    def pick(cands, dt):
+        if pd.notna(dt):
+            gap = (pd.to_datetime(cands["dt"]) - dt).abs().dt.days.fillna(10 ** 6)
+        else:
+            gap = pd.Series(0, index=cands.index)
+        order = pd.DataFrame({"gap": gap, "neg_total": -cands["total"]}).sort_values(["gap", "neg_total"], kind="stable")
+        return order.index[0]
+
+    n = len(interest)
+    tgt_rcpt, tgt_cust, tiers = [None] * n, [None] * n, [0] * n
+    cache = {}
+    for pos, (rk, ck, sk, dt) in enumerate(zip(ik["rk"], ik["ck"], ik["sk"], ik["dt"])):
+        hit, tier = exact.get((rk, ck)), 1
+        if hit is None:
+            cn = ck.strip().upper()
+            ckey = (cn, sk, dt if pd.notna(dt) else None)
+            if ckey not in cache:
+                found, found_tier = None, 0
+                cands = by_customer.get(cn)
+                if cands is not None and not cands.empty:
+                    placeholder = cn in IGNORED_CUSTOMER_NAMES
+                    same_store = cands[cands["sk"] == sk]
+                    if pd.notna(dt):
+                        same_day = same_store[pd.to_datetime(same_store["dt"]) == dt]
+                        if not same_day.empty:
+                            found, found_tier = pick(same_day, dt), 2
+                    if found is None and not placeholder and not same_store.empty:
+                        found, found_tier = pick(same_store, dt), 3
+                    if found is None and not placeholder:
+                        found, found_tier = pick(cands, dt), 4
+                cache[ckey] = (found, found_tier)
+            hit, tier = cache[ckey]
+        if hit is not None:
+            tgt_rcpt[pos], tgt_cust[pos], tiers[pos] = rec.at[hit, "rcpt"], rec.at[hit, "cust"], tier
+
+    return pd.DataFrame({"TARGET_RECEIPT": pd.Series(tgt_rcpt, dtype=object).to_numpy(),
+                         "TARGET_CUSTOMER": pd.Series(tgt_cust, dtype=object).to_numpy(),
+                         "TIER": tiers}, index=interest.index)
+
+
 def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
-                         applied_reason, unapplied_reason, applied_mask=None):
+                         applied_reason, unapplied_reason, applied_mask=None, matches=None):
     """
     One audit row per interest line, with:
       INTEREST_AMOUNT          this line's interest amount
-      RECEIPT_INTEREST_TOTAL   all interest on the receipt + customer      (first line of each receipt only)
+      INTEREST_MATCH_METHOD    which rule paired the line with a sale receipt
+      MATCHED_RECEIPT_NO       the sale receipt the interest was added to
+      RECEIPT_INTEREST_TOTAL   all interest added to that sale receipt     (first line of each receipt only)
       INTEREST_ADDED_TO_SALES  how much the sale lines actually went up    (first line of each receipt only)
       INTEREST_VARIANCE        total minus added; should be 0.00           (first line of each receipt only)
       INTEREST_CHECK           OK / MISMATCH / NOT APPLIED                 (every line)
@@ -573,6 +668,11 @@ def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
     """
     audit = interest_rows.copy()
     key = _receipt_key(audit)
+    tier = np.zeros(len(audit), dtype=int)
+    if matches is not None:
+        tier = matches["TIER"].to_numpy().astype(int)
+        target_key = [f"{r}||{c}" for r, c in zip(matches["TARGET_RECEIPT"], matches["TARGET_CUSTOMER"])]
+        key = pd.Series(np.where(tier > 0, np.array(target_key, dtype=object), key.to_numpy()), index=audit.index)
     amount = pd.to_numeric(audit[price_col], errors="coerce").fillna(0)
 
     receipt_total = key.map(amount.groupby(key.to_numpy()).sum()).astype(float)
@@ -586,8 +686,15 @@ def build_interest_audit(interest_rows, sums_before, sums_after, price_col,
     off_total = variance.abs().to_numpy() > 0.005
     first = ~key.duplicated().to_numpy()
 
-    audit["REMOVAL_REASON"] = np.where(applied, applied_reason, unapplied_reason)
+    reasons = np.where(applied, applied_reason, unapplied_reason).astype(object)
+    for t, label in INTEREST_MATCH_LABELS.items():
+        if t > 1:
+            reasons[(tier == t) & applied] = f"{applied_reason} - Matched By {label}"
+    audit["REMOVAL_REASON"] = reasons
     audit["INTEREST_AMOUNT"] = amount.round(2).to_numpy()
+    if matches is not None:
+        audit["INTEREST_MATCH_METHOD"] = [INTEREST_MATCH_LABELS.get(int(t), "No Matching Sale Found") for t in tier]
+        audit["MATCHED_RECEIPT_NO"] = matches["TARGET_RECEIPT"].to_numpy()
     for col, vals in (("RECEIPT_INTEREST_TOTAL", receipt_total),
                       ("INTEREST_ADDED_TO_SALES", added),
                       ("INTEREST_VARIANCE", variance)):
@@ -729,14 +836,18 @@ def process_database(input_file_path: str, progress=None) -> tuple[int, str, dic
     )
 
     if interest_mask.any() and "RECEIPT_NO" in df.columns and "CUSTOMER_NAME" in df.columns:
-        keys = ["RECEIPT_NO", "CUSTOMER_NAME"]
         df["CUSTOMER_NAME"] = df["CUSTOMER_NAME"].fillna("")
 
         interest = df[interest_mask]
         main = df[~interest_mask].copy()
         interest_sales_before = _sale_sums_by_receipt(main, "EXT_PRICE_W_TAX")  # audit only
 
-        totals = interest.groupby(keys)["EXT_PRICE_W_TAX"].sum()
+        interest_matches = match_interest_to_sales(interest, main, "EXT_PRICE_W_TAX")
+        interest_hit = interest_matches["TIER"].to_numpy() > 0
+        totals = interest.loc[interest_hit, "EXT_PRICE_W_TAX"].groupby(
+            [interest_matches.loc[interest_hit, "TARGET_RECEIPT"].rename("RECEIPT_NO"),
+             interest_matches.loc[interest_hit, "TARGET_CUSTOMER"].rename("CUSTOMER_NAME")]
+        ).sum()
         amounts = main["EXT_PRICE_W_TAX"].fillna(0)
         target = amounts.groupby([main["RECEIPT_NO"], main["CUSTOMER_NAME"]]).idxmax()
 
@@ -746,13 +857,17 @@ def process_database(input_file_path: str, progress=None) -> tuple[int, str, dic
             main.loc[rows, "EXT_PRICE_W_TAX"].fillna(0).values + totals.loc[matched].values
         )
 
-        is_matched = interest.set_index(keys).index.isin(matched)
+        is_matched = (
+            pd.MultiIndex.from_arrays([interest_matches["TARGET_RECEIPT"], interest_matches["TARGET_CUSTOMER"]]).isin(matched)
+            & interest_hit
+        )
         df = pd.concat([main, interest[~is_matched]], ignore_index=True)
         audit_log.append(build_interest_audit(
             interest, interest_sales_before, _sale_sums_by_receipt(main, "EXT_PRICE_W_TAX"), "EXT_PRICE_W_TAX",
             applied_reason="Interest Line - Added To Largest Sale Line On Receipt",
-            unapplied_reason="Interest Line - NOT ADDED (no sale line on receipt; kept as its own row)",
+            unapplied_reason="Interest Line - NOT ADDED (no sale line found by receipt, store + customer, or customer; kept as its own row)",
             applied_mask=is_matched,
+            matches=interest_matches,
         ))
 
     say("Matching sale/return pairs…")
