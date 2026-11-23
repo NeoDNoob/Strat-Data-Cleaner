@@ -20,6 +20,9 @@ import traceback
 import subprocess
 import re
 import math
+import csv
+import shutil
+from tkinter import ttk
 
 from PIL import Image, ImageDraw, ImageTk
 
@@ -149,7 +152,7 @@ LOG_MIN_HEIGHT_COMPACT = 84
 LOG_ROW_MIN = 70              # the log row never collapses below this in single-column mode
 SCREEN_RESERVE_PX = 100       # taskbar + window title bar, in real pixels (fallback when the monitor is unknown)
 TITLEBAR_RESERVE_PX = 56      # title bar + borders, in real pixels (the monitor work area already excludes the taskbar)
-APP_VERSION = "v3.12.22"
+APP_VERSION = "v3.14.22"
 CURRENT_YEAR = datetime.datetime.now().year
 BASE_TITLE = "Strat Data Cleaner"
 CONFIG_PATH = Path.home() / ".strat_data_cleaner.json"
@@ -987,6 +990,292 @@ def save_config(cfg):
 
 
 # ======================================================================
+# Output settings (saved in the config file, so they apply to every future run, not just this session)
+# ======================================================================
+OUTPUT_TOKENS = ("name", "source", "cleaner", "date", "time")
+DEFAULT_OUTPUT = {"mode": "default", "folder": "", "template": "{name}"}
+_BAD_NAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def get_output_settings():
+    """The saved output settings, with anything missing or invalid replaced by the defaults."""
+    raw = CONFIG.get("output") if isinstance(CONFIG.get("output"), dict) else {}
+    out = dict(DEFAULT_OUTPUT)
+    if raw.get("mode") == "custom" and str(raw.get("folder") or "").strip():
+        out["mode"], out["folder"] = "custom", str(raw["folder"]).strip()
+    template = str(raw.get("template") or "").strip()
+    if template:
+        out["template"] = template
+    return out
+
+
+def output_is_customised(cfg=None):
+    cfg = cfg or get_output_settings()
+    return cfg["mode"] == "custom" or cfg["template"] != DEFAULT_OUTPUT["template"]
+
+
+def unknown_tokens(template):
+    return sorted({t for t in re.findall(r"\{(\w*)\}", template) if t not in OUTPUT_TOKENS})
+
+
+def render_output_name(template, name, source, cleaner, now=None):
+    """Fills the tokens of a file-name template and makes the result a legal Windows file name (no extension)."""
+    now = now or datetime.datetime.now()
+    values = {"name": name, "source": source, "cleaner": cleaner,
+              "date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H%M")}
+    text = re.sub(r"\{(\w*)\}", lambda m: values.get(m.group(1), m.group(0)), template or "{name}")
+    text = _BAD_NAME_CHARS.sub("_", text)
+    text = re.sub(r"\s+", " ", text).strip().rstrip(". ")     # a trailing dot or space is not allowed on Windows
+    return text[:150].rstrip(". ") or _BAD_NAME_CHARS.sub("_", name)
+
+
+def _unique_path(path):
+    """The path itself if free, otherwise 'name (2).ext', 'name (3).ext'... so nothing is ever overwritten."""
+    path = Path(path)
+    if not path.exists():
+        return path
+    for n in range(2, 1000):
+        candidate = path.with_name(f"{path.stem} ({n}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem} ({int(time.time())}){path.suffix}")
+
+
+def apply_output_settings(output_path, cleaner_label, source_path=None):
+    """Moves / renames a freshly cleaned file according to the saved output settings.
+    Returns the final path. With the default settings (or on any problem) the file stays where it is."""
+    cfg = get_output_settings()
+    if not output_is_customised(cfg):
+        return output_path
+    try:
+        src = Path(output_path)
+        if not src.is_file():
+            return output_path
+        stem = render_output_name(cfg["template"], src.stem, Path(source_path).stem if source_path else "", cleaner_label)
+        if src.suffix and stem.lower().endswith(src.suffix.lower()):    # the template already ends in ".xlsx"
+            stem = stem[:-len(src.suffix)].rstrip(". ") or src.stem
+        dest_dir = Path(cfg["folder"]) if cfg["mode"] == "custom" else src.parent
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / (stem + src.suffix)
+        try:
+            if dest.exists() and os.path.samefile(dest, src):
+                return output_path                                      # already named and placed as requested
+        except OSError:
+            pass
+        dest = _unique_path(dest)
+        shutil.move(str(src), str(dest))
+        return str(dest)
+    except Exception as e:
+        log_message(f"Warning: Output settings could not be applied ({e}). "
+                    "The cleaned file stays where the cleaner saved it.")
+        return output_path
+
+
+# ======================================================================
+# Activity-log search: highlights every match, Enter / Shift+Enter jump between them
+# ======================================================================
+_log_search = {"entry": None, "count": None, "query": "", "matches": [], "cur": -1}
+LOG_HIT_BG = "#4B3A0E"
+LOG_CUR_BG = "#F59E0B"
+LOG_MAX_HITS = 2000
+
+
+def _set_search_count(text, color=MUTED_TEXT):
+    lbl = _log_search["count"]
+    if lbl is not None:
+        try:
+            lbl.configure(text=text, text_color=color)
+        except Exception:
+            pass
+
+
+def _goto_log_match(i, scroll=True):
+    matches = _log_search["matches"]
+    if not matches:
+        return
+    i %= len(matches)
+    _log_search["cur"] = i
+    tb = status_box._textbox
+    tb.tag_remove("searchcur", "1.0", "end")
+    start, end = matches[i]
+    tb.tag_add("searchcur", start, end)
+    if scroll:
+        tb.see(start)
+    _set_search_count(f"{i + 1}/{len(matches)}", WHITE)
+
+
+def _refresh_log_search(jump=False):
+    """Re-finds the matches of the search text. Only visible lines count (the level filter is respected),
+    and the [time] stamps are skipped so that searching 'AM' or '5' does not light up every line."""
+    if _log_search["entry"] is None:
+        return
+    try:
+        tb = status_box._textbox
+        query = _log_search["query"]
+        tb.tag_remove("searchhit", "1.0", "end")
+        tb.tag_remove("searchcur", "1.0", "end")
+        matches = []
+        if query:
+            length = tk.IntVar(master=tb)
+            idx = "1.0"
+            while len(matches) < LOG_MAX_HITS:
+                pos = tb.search(query, idx, stopindex="end", nocase=True, count=length)
+                if not pos or length.get() <= 0:
+                    break
+                if "stamp" in tb.tag_names(pos):
+                    idx = f"{pos}+1c"
+                    continue
+                end = f"{pos}+{length.get()}c"
+                tb.tag_add("searchhit", pos, end)
+                matches.append((pos, end))
+                idx = end
+        prev = _log_search["cur"]
+        _log_search["matches"] = matches
+        if not query:
+            _log_search["cur"] = -1
+            _set_search_count("")
+        elif not matches:
+            _log_search["cur"] = -1
+            _set_search_count("No match", WARNING_COLOR)
+        else:
+            cur = len(matches) - 1 if (jump or prev < 0) else min(prev, len(matches) - 1)
+            _goto_log_match(cur, scroll=jump)
+    except Exception:
+        pass
+
+
+def _on_log_search_key(_event=None):
+    entry = _log_search["entry"]
+    if entry is None:
+        return
+    query = entry.get()
+    if query != _log_search["query"]:
+        _log_search["query"] = query
+        _refresh_log_search(jump=True)
+
+
+def _log_search_step(delta):
+    def handler(_event=None):
+        if _log_search["matches"]:
+            _goto_log_match(_log_search["cur"] + delta)
+        return "break"
+    return handler
+
+
+def clear_log_search(_event=None):
+    entry = _log_search["entry"]
+    if entry is not None:
+        entry.delete(0, "end")
+        _log_search["query"] = ""
+        _refresh_log_search()
+        app.focus_set()
+    return "break"
+
+
+def focus_log_search(_event=None):
+    entry = _log_search["entry"]
+    if entry is not None:
+        entry.focus_set()
+        try:
+            entry.select_range(0, "end")
+        except Exception:
+            pass
+    return "break"
+
+
+# ======================================================================
+# File preview: the first rows of the loaded file, read without pandas (so the UI process stays light)
+# ======================================================================
+PREVIEW_ROWS = 20
+PREVIEW_COLS = 40
+PREVIEW_CELL_CHARS = 60
+PREVIEW_SCAN_ROWS = 500       # how far down to look for non-empty rows
+
+
+def _preview_cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, datetime.datetime):
+        return v.strftime("%Y-%m-%d") if not (v.hour or v.minute or v.second) else v.strftime("%Y-%m-%d %H:%M")
+    if isinstance(v, datetime.date):
+        return v.isoformat()
+    if isinstance(v, float):
+        return str(int(v)) if v.is_integer() and abs(v) < 1e15 else format(v, ".10g")
+    s = str(v).replace("\r", " ").replace("\n", " ").strip()
+    return s if len(s) <= PREVIEW_CELL_CHARS else s[:PREVIEW_CELL_CHARS - 1] + "…"
+
+
+def _col_letter(j):
+    s = ""
+    j += 1
+    while j:
+        j, r = divmod(j - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _read_preview(path, sheet=None):
+    """Returns {"rows": [(row number, [cells])], "ncols", "shown_cols", "sheets", "sheet", "total_text", "error"}.
+    The first row in 'rows' is the header. Runs in a thread; never raises."""
+    ext = Path(path).suffix.lower()
+    out = {"rows": [], "ncols": 0, "shown_cols": 0, "sheets": [], "sheet": None, "total_text": None, "error": None}
+    raw = []
+    try:
+        if ext in (".csv", ".txt"):
+            with open(path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+                sample = f.read(8192)
+                f.seek(0)
+                try:
+                    dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+                except csv.Error:
+                    dialect = csv.excel
+                for n, row in enumerate(csv.reader(f, dialect), start=1):
+                    if any(str(c).strip() for c in row):
+                        raw.append((n, row))
+                    if len(raw) > PREVIEW_ROWS or n >= PREVIEW_SCAN_ROWS:
+                        break
+            out["total_text"] = _count_rows(path)
+        elif ext in (".xlsx", ".xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            try:
+                out["sheets"] = list(wb.sheetnames)
+                name = sheet if sheet in out["sheets"] else wb.active.title
+                out["sheet"] = name
+                ws = wb[name]
+                for n, row in enumerate(ws.iter_rows(max_row=PREVIEW_SCAN_ROWS, values_only=True), start=1):
+                    if any(v is not None and str(v).strip() for v in row):
+                        raw.append((n, list(row)))
+                    if len(raw) > PREVIEW_ROWS:
+                        break
+                total = ws.max_row
+                if total and total < 1048576:
+                    out["total_text"] = f"{max(total - 1, 0):,} rows"
+            finally:
+                wb.close()
+        elif ext == ".xls":
+            out["error"] = "Preview is not available for legacy .xls files. Open the file in Excel, or save it as .xlsx first."
+            return out
+        else:
+            out["error"] = "This file type cannot be previewed."
+            return out
+    except Exception as e:
+        out["error"] = f"The file could not be read for the preview ({e})."
+        return out
+
+    if not raw:
+        out["error"] = "No data was found in the first part of this file."
+        return out
+    width = max(len(r) for _, r in raw)
+    cells = [[_preview_cell(c) for c in r] + [""] * (width - len(r)) for _, r in raw]
+    last = max((j for row in cells for j, c in enumerate(row) if c), default=-1)
+    out["ncols"] = last + 1
+    out["shown_cols"] = min(last + 1, PREVIEW_COLS)
+    out["rows"] = [(raw[i][0], cells[i][:out["shown_cols"]]) for i in range(len(raw))]
+    return out
+
+
+# ======================================================================
 # Activity-log tools: level filter + warning badge
 # ======================================================================
 LOG_FILTERS = {"All": None, "Warnings": "warning", "Errors": "error"}
@@ -1003,21 +1292,24 @@ def _apply_log_filter(mode=None):
     for level in _LOG_LEVELS:
         tb.tag_configure(level, elide=(keep is not None and level != keep))
     tb.see("end")
+    _refresh_log_search()
     _refresh_warn_badge()
 
 
 def _refresh_warn_badge():
-    """Shows the number of warnings inside the 'Warnings' filter itself (no separate badge)."""
-    try:
-        count = len(status_box._textbox.tag_ranges("warnline")) // 2
-        btn = log_filter._buttons_dict["Warnings"]
-        if count:
-            colour = WHITE if _log_state["filter"] == "Warnings" else WARNING_COLOR
-            btn.configure(text=f"⚠ Warnings {count}", text_color=colour)
-        else:
-            btn.configure(text="Warnings", text_color=WHITE)
-    except Exception:
-        pass
+    """Shows the number of warnings / errors inside the 'Warnings' and 'Errors' filters themselves (no separate badge).
+    An error counts once per failure, not once per line of its traceback."""
+    for tag, name, icon, accent in (("warnline", "Warnings", "⚠", WARNING_COLOR), ("errline", "Errors", "✗", ERROR_COLOR)):
+        try:
+            count = len(status_box._textbox.tag_ranges(tag)) // 2
+            btn = log_filter._buttons_dict[name]
+            if count:
+                colour = WHITE if _log_state["filter"] == name else accent
+                btn.configure(text=f"{icon} {name} {count}", text_color=colour)
+            else:
+                btn.configure(text=name, text_color=WHITE)
+        except Exception:
+            pass
 
 
 # ======================================================================
@@ -1076,7 +1368,7 @@ def _pulse_log_line():
         pass
 
 
-def log_message(message, level=None):
+def log_message(message, level=None, continued=False):
     """Inserts a timestamped color-coded message into the inline status box safely."""
     global status_box
     try:
@@ -1101,7 +1393,12 @@ def log_message(message, level=None):
                 tag = "notice"  # same orange, but not counted as a warning (e.g. "log cleared", "cancelled")
 
             tb = status_box._textbox
-            tags = (tag, "warnline") if tag == "warning" else (tag,)
+            if tag == "warning":
+                tags = (tag, "warnline")
+            elif tag == "error" and not continued:
+                tags = (tag, "errline")
+            else:
+                tags = (tag,)
             # The timestamp is muted; the line break carries only the level tag (not "warnline"), so two
             # warnings in a row stay two separate ranges and the warning badge counts them correctly.
             tb.insert("end", f"[{timestamp}] ", tags + ("stamp",))
@@ -1116,6 +1413,7 @@ def log_message(message, level=None):
             tb.tag_remove("fresh", "1.0", "end")
             tb.tag_add("fresh", "end-2c linestart", "end-1c")
             _pulse_log_line()
+            _refresh_log_search()
 
             status_box.see("end")
             status_box.configure(state="disabled")
@@ -1297,7 +1595,16 @@ def refresh_steps():
     elif finished:
         states, hint, hint_color = ("done", "done", "active"), "Done — see results below", SUCCESS_COLOR
     else:
-        states, hint, hint_color = ("done", "active", "todo"), "Pick the cleaner that fits your file", INFO_COLOR
+        states = ("done", "active", "todo")
+        if getattr(app, "retail_path", None):
+            if getattr(app, "pair_ok", False):
+                hint, hint_color = "Two files ready — run the Meta Ads Cleaner", INFO_COLOR
+            elif getattr(app, "pair_msg", None):
+                hint, hint_color = "The two files don't match — see the Activity Log", WARNING_COLOR
+            else:
+                hint, hint_color = "Checking the two files…", MUTED_TEXT
+        else:
+            hint, hint_color = "Pick the cleaner that fits your file", INFO_COLOR
 
     for i, ((badge, title, number), state) in enumerate(zip(step_widgets, states)):
         bg, fg, title_color = _STEP_STYLE[state]
@@ -1312,6 +1619,7 @@ dot_count = 0
 start_time = 0
 _banner_secs = -1
 _stage_text = ""
+_typical_text = ""   # "about 14 s" while a run is in progress and enough past runs are known
 
 
 def set_stage(text):
@@ -1338,7 +1646,8 @@ def animate_process_state(button, base_text):
             m, s = divmod(elapsed, 60)
             time_str = f"{m} min {s} sec" if m > 0 else f"{s} sec"
             stage = f"  ·  {_stage_text}" if _stage_text else ""
-            set_banner(f"Running {base_text}{stage}  ·  {time_str}", INFO_COLOR)
+            typical = f"  ·  usually ~{_typical_text}" if _typical_text else ""
+            set_banner(f"Running {base_text}{stage}  ·  {time_str}{typical}", INFO_COLOR)
 
         dot_count += 1
         animation_job = app.after(SPINNER_INTERVAL_MS, lambda: animate_process_state(button, base_text))
@@ -1368,7 +1677,7 @@ def _lower_priority():
         pass
 
 
-def _worker_entry(module_name, func_name, file_path, result_q):
+def _worker_entry(module_name, func_name, file_path, result_q, extra_path=None):
     """Entry point of the worker process. Imports the cleaner here, so the UI process never loads pandas."""
     try:
         if sys.stdout is None:
@@ -1379,8 +1688,11 @@ def _worker_entry(module_name, func_name, file_path, result_q):
         cleaner_func = getattr(importlib.import_module(module_name), func_name)
         kwargs = {}
         try:  # cleaners that accept `progress` stream stage messages; older ones simply run as before
-            if "progress" in inspect.signature(cleaner_func).parameters:
+            params = inspect.signature(cleaner_func).parameters
+            if "progress" in params:
                 kwargs["progress"] = lambda text: result_q.put(("progress", str(text)))
+            if extra_path and "retail_path" in params:   # two-file cleaners (Meta Ads + retail sales)
+                kwargs["retail_path"] = extra_path
         except (TypeError, ValueError):
             pass
         result = cleaner_func(file_path, **kwargs)
@@ -1459,6 +1771,16 @@ def poll_worker(button, base_text, default_color, hover_color):
 _unlock_jobs = []
 
 
+def _cleaner_available(c):
+    """One file loaded -> the single-file cleaners. Two files loaded and recognised as Meta Ads + retail -> only the
+    Meta Ads Cleaner."""
+    has_first = bool(getattr(app, "selected_path", None))
+    has_second = bool(getattr(app, "retail_path", None))
+    if c.get("two_file"):
+        return has_first and has_second and bool(getattr(app, "pair_ok", False))
+    return has_first and not has_second
+
+
 def _enable_cleaner(b, c, pulse=False):
     b.configure(state="normal", fg_color=c["color"], hover_color=c["hover"],
                 border_color=c["accent"], text=c["label"])
@@ -1479,7 +1801,7 @@ def set_cleaners_enabled(enabled, except_btn=None, stagger=False):
         b = c["btn"]
         if b is except_btn:
             continue
-        if enabled:
+        if enabled and _cleaner_available(c):
             if stagger and _motion["on"] and b.cget("state") == "disabled":
                 _unlock_jobs.append(app.after(i * 45, lambda b=b, c=c: _enable_cleaner(b, c, pulse=True)))
             else:
@@ -1501,18 +1823,20 @@ def _finish_common():
     set_cleaners_enabled(True)
     upload_btn.configure(state="normal")
     cancel_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
+    _reset_cancel_slot()
     if getattr(app, "selected_path", None):
         clear_btn.configure(state="normal")
 
 
-def _clean_key(file_path, cleaner_label):
-    """Identity of one clean: the file NAME (case-insensitive) plus the cleaner used."""
-    return (Path(file_path).name.casefold(), cleaner_label)
+def _clean_key(file_path, cleaner_label, extra_path=None):
+    """Identity of one clean: the file NAME (case-insensitive), the second file's name for two-file cleaners,
+    plus the cleaner used."""
+    return (Path(file_path).name.casefold(), cleaner_label, Path(extra_path).name.casefold() if extra_path else "")
 
 
-def already_cleaned(file_path, cleaner_label):
-    """True when this file name was already cleaned successfully with this cleaner in this session."""
-    return _clean_key(file_path, cleaner_label) in getattr(app, "cleaned_log", set())
+def already_cleaned(file_path, cleaner_label, extra_path=None):
+    """True when this file (pair) was already cleaned successfully with this cleaner in this session."""
+    return _clean_key(file_path, cleaner_label, extra_path) in getattr(app, "cleaned_log", set())
 
 
 def warn_already_cleaned(cleaner_label):
@@ -1521,9 +1845,9 @@ def warn_already_cleaned(cleaner_label):
     set_banner(f"Already cleaned this file with {cleaner_label}", WARNING_COLOR)
 
 
-def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_color, force=False):
+def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_color, force=False, extra_path=None):
     """Runs a cleaner ((module_name, function_name)) in a worker process with live updates and real cancellation."""
-    global start_time, dot_count, _banner_secs, _stage_text
+    global start_time, dot_count, _banner_secs, _stage_text, _typical_text
     if getattr(app, 'is_processing', False):
         return
 
@@ -1531,13 +1855,23 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
         log_message("Warning: Please upload a retail file before running the cleaner.")
         return
 
-    if not force and already_cleaned(app.selected_path, base_text):
+    if not force and already_cleaned(app.selected_path, base_text, extra_path):
         warn_already_cleaned(base_text)
         return
 
     file_name = Path(app.selected_path).name
     app.current_run = (file_name, base_text)
-    log_message(f"Processing file on '{file_name}' using {base_text}...")
+    app.current_extra = extra_path
+    if extra_path:
+        log_message(f"Processing '{file_name}' + '{Path(extra_path).name}' using {base_text}...")
+    else:
+        log_message(f"Processing file on '{file_name}' using {base_text}...")
+
+    app.current_size_mb = _input_size_mb([app.selected_path, extra_path])
+    _est = estimate_seconds(base_text, app.current_size_mb)
+    _typical_text = _approx_duration(_est) if _est else ""
+    if _typical_text:
+        log_message(f"Usually takes about {_typical_text} for a file this size.")
 
     app.is_processing = True
     app.cancel_requested = False
@@ -1546,6 +1880,7 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
 
     upload_btn.configure(state="disabled")
     clear_btn.configure(state="disabled")
+    _reset_cancel_slot()
     cancel_btn.configure(state="normal", fg_color=CANCEL_COLOR, hover_color=CANCEL_HOVER)
     set_banner(f"Starting {base_text}...", INFO_COLOR)
     set_progress("running")
@@ -1562,7 +1897,7 @@ def run_cleaner_process(cleaner_ref, button, base_text, default_color, hover_col
 
     try:
         result_q = _ctx.Queue()
-        proc = _ctx.Process(target=_worker_entry, args=(cleaner_ref[0], cleaner_ref[1], app.selected_path, result_q), daemon=True)
+        proc = _ctx.Process(target=_worker_entry, args=(cleaner_ref[0], cleaner_ref[1], app.selected_path, result_q, extra_path), daemon=True)
         proc.start()
     except Exception:
         handle_error(traceback.format_exc(), button, base_text, default_color, hover_color)
@@ -1768,6 +2103,35 @@ def log_run_summary(stats):
         warnings += 1
         shown = ", ".join(unmapped[:8]) + (f" … (+{len(unmapped) - 8} more)" if len(unmapped) > 8 else "")
         log_message(f"Warning: {len(unmapped)} store name(s) not in the store map, kept as-is: {shown}")
+    retail = stats.get("retail")
+    if retail:
+        log_message(f"Retail: {retail['rows_in']:,} rows read, {retail['retail_rows_out']:,} Retail Data rows, "
+                    f"{retail['online_receipts']:,} distinct online transactions")
+        if retail.get("interest_lines") or retail.get("zz_removed"):
+            log_message(f"   Interest lines set aside: {retail.get('interest_lines', 0):,}  ·  "
+                        f"ZZ paper-bag lines removed: {retail.get('zz_removed', 0):,}  (see Audit)")
+        if retail.get("stores_masked"):
+            masks = retail["stores_masked"]
+            more = f" … (+{len(masks) - 6} more)" if len(masks) > 6 else ""
+            log_message("   Retail store masks applied: " + "; ".join(masks[:6]) + more)
+        if retail.get("online_returns_excluded"):
+            log_message(f"   Online return lines not counted: {retail['online_returns_excluded']:,}")
+        if retail.get("online_no_receipt"):
+            warnings += 1
+            log_message(f"Warning: {retail['online_no_receipt']:,} online line(s) had no receipt number and were not counted")
+        if retail.get("unmapped_stores"):
+            warnings += 1
+            shown = ", ".join(retail["unmapped_stores"][:8]) + (f" … (+{len(retail['unmapped_stores']) - 8} more)" if len(retail["unmapped_stores"]) > 8 else "")
+            log_message(f"Warning: {len(retail['unmapped_stores'])} retail store name(s) not in the recognized store list, kept as-is: {shown}")
+        if retail.get("unmapped_brands"):
+            warnings += 1
+            log_message(f"Warning: {len(retail['unmapped_brands'])} retail brand(s) do not match a Meta Ads brand name, kept as-is: {', '.join(retail['unmapped_brands'][:8])}")
+        if retail.get("other_tags"):
+            warnings += 1
+            log_message(f"Warning: retail TAG values other than Online/Offline found: {', '.join(retail['other_tags'][:8])}")
+        if retail.get("interest_unmatched"):
+            warnings += 1
+            log_message(f"Warning: {retail['interest_unmatched']:,} retail interest line(s) had no matching sale line (see Audit)")
     if stats.get("interest_unapplied"):
         warnings += 1
         log_message(f"Warning: {stats['interest_unapplied']} interest line(s) had no sale line on their receipt (see the Removal Audit Log)")
@@ -1779,9 +2143,12 @@ def log_run_summary(stats):
 
 def handle_success(row_count, output_path, elapsed_seconds, button, base_text, default_color, hover_color, stats=None):
     _finish_common()
+    _final_path = apply_output_settings(output_path, base_text, getattr(app, "selected_path", None))
+    relocated = _final_path != output_path
+    output_path = _final_path
     app.run_done = True
     if getattr(app, "selected_path", None):
-        app.cleaned_log.add(_clean_key(app.selected_path, base_text))
+        app.cleaned_log.add(_clean_key(app.selected_path, base_text, getattr(app, "current_extra", None)))
     duration_str = format_duration(elapsed_seconds)
 
     set_progress("success")
@@ -1793,26 +2160,161 @@ def handle_success(row_count, output_path, elapsed_seconds, button, base_text, d
         set_banner(f"Completed — {int(row_count):,} rows cleaned in {duration_str}", SUCCESS_COLOR)
     set_title("Completed")
     update_stats(row_count, elapsed_seconds)
+    record_timing(base_text, getattr(app, "current_size_mb", None), elapsed_seconds)
 
     app.last_output_path = output_path
     log_message(f"Saved to: {output_path}")
+    if relocated:
+        log_message("Output settings applied to the cleaned file.")
     open_output_btn.configure(state="normal", fg_color=OPEN_BTN_COLOR, hover_color=OPEN_BTN_HOVER)
+    preview_result_btn.configure(state="normal")
     refresh_steps()
     add_history("warn" if warn_count else "ok", _current_file_name(), base_text,
                 rows=int(row_count), elapsed=elapsed_seconds, warns=warn_count, output=output_path)
     notify_done("warning" if warn_count else "success", elapsed_seconds)
 
 
+# ======================================================================
+# Typical run time: learned from this machine's own past runs (kept per cleaner in the config file)
+# ======================================================================
+TIMING_KEEP = 12
+
+
+def _input_size_mb(paths):
+    try:
+        return sum(os.path.getsize(p) for p in paths if p) / (1024 * 1024)
+    except Exception:
+        return None
+
+
+def estimate_seconds(label, size_mb):
+    """Median time of the (up to) three past runs whose input size was closest to this one, or None when there are
+    fewer than two runs on record for this cleaner."""
+    if size_mb is None:
+        return None
+    runs = CONFIG.get("timings", {}).get(label, []) if isinstance(CONFIG.get("timings"), dict) else []
+    good = []
+    for r in runs:
+        try:
+            good.append((float(r[0]), float(r[1])))
+        except Exception:
+            continue
+    if len(good) < 2:
+        return None
+    nearest = sorted(good, key=lambda r: abs(r[0] - size_mb))[:3]
+    times = sorted(t for _, t in nearest)
+    return times[len(times) // 2]
+
+
+def record_timing(label, size_mb, seconds):
+    """Remembers a successful run (cancelled and failed runs say nothing about how long a clean takes)."""
+    if size_mb is None or not seconds or seconds <= 0:
+        return
+    try:
+        timings = CONFIG.get("timings") if isinstance(CONFIG.get("timings"), dict) else {}
+        runs = list(timings.get(label, []))
+        runs.append([round(size_mb, 3), round(seconds, 2)])
+        timings[label] = runs[-TIMING_KEEP:]
+        CONFIG["timings"] = timings
+        save_config(CONFIG)
+    except Exception:
+        pass
+
+
+def _approx_duration(seconds):
+    s = max(1, int(round(seconds)))
+    return f"{s} s" if s < 60 else f"{s // 60} min {s % 60:02d} s"
+
+
+# ======================================================================
+# Failed runs: a plain-language summary, and a one-click error report (the idle Cancel button becomes "Copy error")
+# ======================================================================
+def explain_error(tb_text):
+    """One plain sentence for the usual failures, from the last line of the traceback."""
+    lines = [ln.strip() for ln in str(tb_text).strip().splitlines() if ln.strip()]
+    last = lines[-1] if lines else ""
+    name, _, detail = last.partition(":")
+    name, detail = name.split(".")[-1].strip(), detail.strip()
+    low = last.lower()
+    if "permissionerror" in low:
+        return "A file is locked or cannot be written. If the output or source file is open in Excel, close it and run again."
+    if "memory" in low:
+        return "The file was too large for the available memory."
+    if name == "KeyError":
+        return f"A column the cleaner expects was not found ({detail or 'unknown'}). This file may not match the cleaner you chose."
+    if name in ("FileNotFoundError", "NotADirectoryError"):
+        return "A file or folder could not be found. It may have been moved or renamed after it was loaded."
+    if name in ("BadZipFile",) or "not a zip file" in low:
+        return "The file looks damaged or is not a real .xlsx workbook."
+    if name in ("ModuleNotFoundError", "ImportError"):
+        return "A library or cleaner module is missing from this build of the app."
+    if name in ("ValueError", "ParserError", "EmptyDataError", "UnicodeDecodeError") or "could not convert" in low:
+        return "Some values are not in the format this cleaner expects. This file may not match the cleaner you chose."
+    return f"The cleaner stopped with {name or 'an unexpected error'}." if last else "The cleaner stopped unexpectedly."
+
+
+def _reset_cancel_slot():
+    """Puts the Cancel button back (it doubles as 'Copy error' after a failed run)."""
+    app.last_error = None
+    try:
+        cancel_btn.configure(text="Cancel", command=request_cancel)
+        if not getattr(app, "is_processing", False):
+            cancel_btn.configure(state="disabled", fg_color=OPEN_BTN_DISABLED, hover_color=OPEN_BTN_DISABLED)
+    except Exception:
+        pass
+
+
+def _store_last_error(tb_text, cleaner_label, plain):
+    names = [Path(p).name for p in (getattr(app, "selected_path", None), getattr(app, "current_extra", None)) if p]
+    size = _input_size_mb([getattr(app, "selected_path", None), getattr(app, "current_extra", None)])
+    app.last_error = "\n".join([
+        f"Strat Data Cleaner {APP_VERSION} - error report",
+        f"Time: {datetime.datetime.now():%Y-%m-%d %H:%M:%S}",
+        f"Cleaner: {cleaner_label}",
+        "File: " + "  +  ".join(names) + (f"  ({size:.2f} MB)" if size is not None else ""),
+        f"System: {sys.platform}, Python {sys.version.split()[0]}",
+        f"Summary: {plain}",
+        "",
+        "Traceback:",
+        str(tb_text).strip(),
+    ])
+
+
+def _show_copy_error_slot():
+    try:
+        cancel_btn.configure(text="Copy error", command=copy_last_error, state="normal",
+                             fg_color=SURFACE_BG, hover_color="#334155")
+    except Exception:
+        pass
+
+
+def copy_last_error():
+    report = getattr(app, "last_error", None)
+    if not report:
+        return
+    try:
+        app.clipboard_clear()
+        app.clipboard_append(report)
+        show_toast("Error details copied to clipboard", "success")
+    except Exception as e:
+        log_message(f"Error copying the error details: {e}")
+
+
 def handle_error(error_message, button, base_text, default_color, hover_color):
     _finish_common()
     set_progress("error")
-    set_banner("Something went wrong — details are in the Activity Log", ERROR_COLOR)
+    plain = explain_error(error_message)
+    set_banner(f"Failed — {plain}", ERROR_COLOR)
     set_title("Failed")
 
     log_message("Error during cleaning process:", level="error")
+    log_message(f"In short: {plain}", level="error", continued=True)
     for line in error_message.strip().split("\n"):
-        log_message(line, level="error")
-    log_message("Tip: make sure the selected file matches the cleaner you chose, then try again.")
+        log_message(line, level="error", continued=True)
+    log_message("Tip: make sure the selected file matches the cleaner you chose, then try again. "
+                "“Copy error” (next to the status bar) copies the full details.")
+    _store_last_error(error_message, base_text, plain)
+    _show_copy_error_slot()
     refresh_steps()
     add_history("err", _current_file_name(), base_text)
     notify_done("error", time.time() - start_time)
@@ -1870,9 +2372,74 @@ def _count_rows(path):
     return None
 
 
+# Header cells that identify the two kinds of file (kept in sync with meta_ads_cleaner.py).
+_META_HEADER = {"date", "campaign name", "ad set name", "cost"}
+_RETAIL_HEADER = {"store_name", "rcpt_date", "receipt_no", "brand", "tag"}
+
+
+def _kind_of_rows(rows):
+    for row in rows:
+        cells = {str(v).strip().lower() for v in row if v is not None and str(v).strip()}
+        if _META_HEADER <= cells:
+            return "meta"
+        if _RETAIL_HEADER <= cells:
+            return "retail"
+    return None
+
+
+def _sniff_kind(path):
+    """'meta', 'retail', 'other' (readable, neither) or 'unreadable', from the first rows only. Runs in a thread."""
+    ext = Path(path).suffix.lower()
+    try:
+        if ext in (".csv", ".txt"):
+            with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+                rows = [re.split(r"[,\t;|]", f.readline().replace('"', "")) for _ in range(15)]
+            return _kind_of_rows(rows) or "other"
+        if ext in (".xlsx", ".xlsm"):
+            import openpyxl
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+            try:
+                for ws in wb.worksheets:
+                    kind = _kind_of_rows(ws.iter_rows(min_row=1, max_row=15, values_only=True))
+                    if kind:
+                        return kind
+            finally:
+                wb.close()
+            return "other"
+    except Exception:
+        return "unreadable"
+    return "unreadable"          # legacy .xls and anything else: columns cannot be checked here
+
+
+def _pair_assignment(paths, kinds):
+    """(meta_path, retail_path, None) for a valid pair in either order, else (None, None, what is wrong)."""
+    if sorted(kinds) == ["meta", "retail"]:
+        i = kinds.index("meta")
+        return paths[i], paths[1 - i], None
+    if kinds[0] == kinds[1] and kinds[0] in ("meta", "retail"):
+        what = "Meta Ads exports" if kinds[0] == "meta" else "retail sales files"
+        return None, None, f"Both files look like {what}. Select one Meta Ads export and one retail sales file."
+    problems = []
+    for p, k in zip(paths, kinds):
+        name = Path(p).name
+        if k == "other":
+            problems.append(f"“{name}” is neither a Meta Ads export (Date, Campaign name, Ad set name, Cost) "
+                            "nor a retail sales file (STORE_NAME, RCPT_DATE, RECEIPT_NO, BRAND, TAG)")
+        elif k == "unreadable":
+            problems.append(f"“{name}” could not be read to check its columns (use .xlsx or .csv)")
+    return None, None, "; ".join(problems) + ". The Meta Ads Cleaner stays locked."
+
+
+def _short_name(path, limit=24):
+    name = Path(path).name
+    return name if len(name) <= limit else name[:limit // 2 - 1] + "…" + name[-(limit // 2):]
+
+
 def _render_file_label(count_text, pending=False):
     name, size_text, modified = app.file_meta
     parts = []
+    if getattr(app, "file_tag", None):
+        parts.append(app.file_tag)
     if pending:
         parts.append("counting rows…")
     elif count_text:
@@ -1882,18 +2449,23 @@ def _render_file_label(count_text, pending=False):
     text = f"{name}  •  {size_text}"
     if parts:
         text += "\n" + "  ·  ".join(parts)
-    set_clamped_text(file_label, "file", text, 11, 2, para_lines=1, text_color=SUCCESS_COLOR)
+    set_clamped_text(file_label, "file", text, 11, 2, para_lines=1,
+                     text_color=WARNING_COLOR if getattr(app, "file_warn", False) else SUCCESS_COLOR)
 
 
-def _start_file_info(filename):
-    """Counts rows off the UI thread and fills in the file card when done (ignored if the file changed)."""
+def _start_file_info(paths):
+    """Counts rows off the UI thread and fills in the file card when done (ignored if the files changed)."""
     token = object()
     app._info_token = token
     box = {"text": None, "done": False}
 
     def work():
         try:
-            box["text"] = _count_rows(filename)
+            texts = [_count_rows(p) for p in paths]
+            if len(paths) == 1:
+                box["text"] = texts[0]
+            else:
+                box["text"] = " + ".join((t.split()[0] if t else "?") for t in texts) + " rows"
         finally:
             box["done"] = True
 
@@ -1910,61 +2482,150 @@ def _start_file_info(filename):
 
     app.after(150, poll)
 
-def process_selected_file(filename):
-    if filename:
-        short_name = Path(filename).name
-        file_size = os.path.getsize(filename)
-        size_text = f"{file_size / (1024 * 1024):.2f} MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.1f} KB"
+
+def _show_files(paths, tag=None, warn=False, count=True):
+    """Fills the file card for one file, or for a pair (names side by side, total size, row counts)."""
+    sizes = [os.path.getsize(p) for p in paths]
+    total = sum(sizes)
+    size_text = f"{total / (1024 * 1024):.2f} MB" if total >= 1024 * 1024 else f"{total / 1024:.1f} KB"
+    if len(paths) == 1:
+        name = Path(paths[0]).name
         try:
-            modified = _format_modified(os.path.getmtime(filename))
+            modified = _format_modified(os.path.getmtime(paths[0]))
         except Exception:
             modified = ""
-        app.file_meta = (short_name, size_text, modified)
-        can_count = Path(filename).suffix.lower() in _COUNTABLE
-        _render_file_label(None, pending=can_count)
-        if can_count:
-            _start_file_info(filename)
-        else:
-            app._info_token = None
-        app.selected_path = filename
-        _refresh_upload_border()
-        app.run_done = False
-        clear_btn.grid(row=0, column=2, padx=(5, 15))
+    else:
+        name, modified = "  +  ".join(_short_name(p) for p in paths), ""
+    app.file_meta = (name, size_text, modified)
+    app.file_tag, app.file_warn = tag, warn
+    can_count = count and all(Path(p).suffix.lower() in _COUNTABLE for p in paths)
+    _render_file_label(None, pending=can_count)
+    if can_count:
+        _start_file_info(paths)
+    else:
+        app._info_token = None
 
+
+def _start_file_check(paths):
+    """Recognises the loaded file(s) by their columns, off the UI thread, then applies the result."""
+    token = object()
+    app._check_token = token
+    box = {"kinds": None}
+
+    def work():
+        try:
+            box["kinds"] = [_sniff_kind(p) for p in paths]
+        except Exception:
+            box["kinds"] = ["unreadable"] * len(paths)
+
+    threading.Thread(target=work, daemon=True).start()
+
+    def poll():
+        if getattr(app, "_check_token", None) is not token:
+            return
+        if box["kinds"] is None:
+            app.after(100, poll)
+            return
+        _apply_file_check(paths, box["kinds"])
+
+    app.after(100, poll)
+
+
+def _apply_file_check(paths, kinds):
+    if len(paths) == 1:
+        if kinds[0] == "meta":    # a heads-up only: the single-file cleaners stay available
+            msg = (f"“{Path(paths[0]).name}” looks like a Meta Ads export. The Meta Ads Cleaner needs two files: "
+                   "Browse again and Ctrl+click the Meta Ads export together with a retail sales file.")
+            log_message(f"Warning: {msg}")
+            set_banner("This looks like a Meta Ads export — select it together with a retail sales file.", WARNING_COLOR)
+        return
+    meta, retail, problem = _pair_assignment(paths, kinds)
+    if problem:
+        app.pair_ok, app.pair_msg = False, problem
+        log_message(f"Warning: {problem}")
+        set_banner("The two files do not match the Meta Ads Cleaner — see the Activity Log.", WARNING_COLOR)
+        _show_files(paths, tag="⚠ files do not match", warn=True, count=False)
+    else:
+        app.selected_path, app.retail_path = meta, retail
+        app.pair_ok, app.pair_msg = True, None
+        log_message(f"Files loaded: Meta Ads = {Path(meta).name}  |  Retail = {Path(retail).name}")
+        set_banner("Two files ready — run the Meta Ads Cleaner.", MUTED_TEXT)
+        _show_files([meta, retail], tag="Meta Ads + retail")
         set_cleaners_enabled(True, stagger=True)
+    refresh_steps()
+    schedule_layout()
 
-        CONFIG["last_dir"] = str(Path(filename).parent)
-        save_config(CONFIG)
 
-        set_progress("idle")
-        set_title(None)
+def process_selected_file(filenames):
+    """Loads one file (single-file cleaners) or two files (Meta Ads + retail)."""
+    paths = [filenames] if isinstance(filenames, str) else list(filenames)
+    if not paths:
+        return
+    app.selected_path = paths[0]
+    app.retail_path = paths[1] if len(paths) == 2 else None
+    app.pair_ok, app.pair_msg = False, None
+    short = Path(paths[0]).name
+    _show_files(paths, tag="checking the two files…" if len(paths) == 2 else None, count=len(paths) == 1)
+    _refresh_upload_border()
+    app.run_done = False
+    clear_btn.grid(row=0, column=2, padx=(5, 15))
+    _close_preview()
+    _reset_cancel_slot()
+    preview_btn.grid(row=0, column=2, sticky="e")
+
+    set_cleaners_enabled(True, stagger=True)   # one file: the single-file cleaners; two files: locked until checked
+
+    CONFIG["last_dir"] = str(Path(paths[0]).parent)
+    save_config(CONFIG)
+
+    set_progress("idle")
+    set_title(None)
+    if len(paths) == 1:
         set_banner("File ready — choose a cleaner in step 2.", MUTED_TEXT)
-        log_message(f"Retail file loaded: {short_name}")
-        refresh_steps()
-        schedule_layout()  # the file name may wrap onto a new line
+        log_message(f"Retail file loaded: {short}")
+    else:
+        set_banner("Checking the two files…", MUTED_TEXT)
+        log_message(f"Two files selected: {short}  +  {Path(paths[1]).name}")
+    _start_file_check(paths)
+    refresh_steps()
+    schedule_layout()  # the file name may wrap onto a new line
 
 
 def upload_file(_event=None):
     if getattr(app, 'is_processing', False):
         return
     initial = CONFIG.get("last_dir")
-    filename = filedialog.askopenfilename(
-        title="Select Retail File",
+    filenames = filedialog.askopenfilenames(
+        title="Select Retail File  (Ctrl+click two files for the Meta Ads Cleaner)",
         initialdir=initial if initial and os.path.isdir(initial) else None,
         filetypes=(("Excel Files", "*.xlsx *.xls"), ("CSV Files", "*.csv"), ("Text Files", "*.txt"), ("All Files", "*.*"))
     )
-    if filename:
-        process_selected_file(filename)
-    else:
+    if isinstance(filenames, str):          # some Tk builds return one string
+        filenames = app.tk.splitlist(filenames)
+    filenames = [f for f in filenames if f]
+    if not filenames:
         log_message("Retail file selection cancelled.")
+    elif len(filenames) > 2:
+        log_message(f"Warning: {len(filenames)} files were selected, but the limit is two (one Meta Ads export and one "
+                    "retail sales file). Nothing was loaded.")
+        set_banner("Too many files — select one file, or two for the Meta Ads Cleaner.", WARNING_COLOR)
+    else:
+        process_selected_file(filenames)
 
 
 def clear_file():
     app.selected_path = None
+    app.retail_path = None
+    app.pair_ok, app.pair_msg = False, None
+    app.file_tag, app.file_warn = None, False
+    app._check_token = None
     app._info_token = None
     app.run_done = False
     set_clamped_text(file_label, "file", FILE_PLACEHOLDER, 11, 2, text_color=MUTED_TEXT)
     clear_btn.grid_forget()
+    preview_btn.grid_forget()
+    _close_preview()
+    _reset_cancel_slot()
     _refresh_upload_border()
 
     set_cleaners_enabled(False)
@@ -2179,16 +2840,463 @@ def custom_askyesno(title, message, allow_remember=True):
     return result[0]
 
 
+# ======================================================================
+# File preview window (read-only, first rows of the loaded file(s))
+# ======================================================================
+def _close_preview():
+    win = getattr(app, "_preview_win", None)
+    app._preview_win = None
+    app._preview_key = None
+    if win is not None:
+        try:
+            win.destroy()
+        except Exception:
+            pass
+
+
+def _style_preview_table(win):
+    style = ttk.Style(win)
+    try:
+        style.theme_use("clam")          # the native Windows theme ignores row / header colours
+    except Exception:
+        pass
+    style.configure("Preview.Treeview", background=CARD_BG, fieldbackground=CARD_BG, foreground=LOG_TEXT,
+                    rowheight=px(24), borderwidth=0, font=("Segoe UI", -px(11)))
+    style.configure("Preview.Treeview.Heading", background=SURFACE_BG, foreground=WHITE, relief="flat",
+                    borderwidth=0, font=("Segoe UI", -px(11), "bold"), padding=(px(6), px(5)))
+    style.map("Preview.Treeview", background=[("selected", ACCENT_ORANGE)], foreground=[("selected", WHITE)])
+    style.map("Preview.Treeview.Heading", background=[("active", "#334155")])
+
+
+def open_result_preview(_event=None):
+    """Preview of the cleaned output file of the last successful run."""
+    path = getattr(app, "last_output_path", None)
+    if not path or not os.path.exists(path):
+        show_toast("No cleaned file to preview yet", "warning")
+        return
+    open_preview(paths=[path], title="Cleaned file preview")
+
+
+def open_preview(_event=None, paths=None, title="File preview"):
+    """Shows the first rows of the loaded file (or either file of a Meta Ads pair), or of the given file(s)."""
+    if paths is None:
+        paths = [p for p in (getattr(app, "selected_path", None), getattr(app, "retail_path", None)) if p]
+    if not paths:
+        show_toast("Select a file first to preview it", "warning")
+        return
+    existing = getattr(app, "_preview_win", None)
+    if existing is not None:
+        if getattr(app, "_preview_key", None) == tuple(paths):
+            try:
+                existing.deiconify()
+                existing.lift()
+                existing.focus_force()
+                return
+            except Exception:
+                pass
+        _close_preview()          # a different file was asked for: replace the window
+    app._preview_key = tuple(paths)
+
+    win = ctk.CTkToplevel(app)
+    win.withdraw()
+    try:
+        tk.Wm.wm_attributes(win, "-alpha", 0.0)
+    except Exception:
+        pass
+    win.title(title)
+    win.configure(fg_color=NAVY_BLUE)
+    win.minsize(640, 380)
+    try:
+        win.iconbitmap(str(resource_path(os.path.join("assets", "strat_data_cleaner.ico"))))
+    except Exception:
+        pass
+    win.transient(app)
+    app._preview_win = win
+    _style_preview_table(win)
+
+    st = {"file": paths[0], "sheet": None, "token": None}
+    labels = {f"{i + 1}. {Path(p).name}": p for i, p in enumerate(paths)}
+
+    # --- header: title + file / sheet pickers ---
+    head = ctk.CTkFrame(win, fg_color="transparent")
+    head.pack(fill="x", padx=18, pady=(16, 2))
+    ctk.CTkLabel(head, text=title, font=("Segoe UI", 14, "bold"), text_color=WHITE).pack(side="left")
+
+    def _menu(values, command):
+        return ctk.CTkOptionMenu(head, values=values, command=command, font=("Segoe UI", 11), height=26, width=190,
+                                 dynamic_resizing=False, fg_color=SURFACE_BG, button_color=SURFACE_BG,
+                                 button_hover_color="#334155", dropdown_fg_color=CARD_BG,
+                                 dropdown_hover_color=SURFACE_BG, text_color=WHITE, dropdown_text_color=WHITE,
+                                 dropdown_font=("Segoe UI", 11), corner_radius=6)
+
+    sheet_menu = _menu(["-"], lambda choice: _pick_sheet(choice))
+    if len(paths) > 1:
+        file_menu = _menu(list(labels), lambda choice: _pick_file(choice))
+        file_menu.set(next(iter(labels)))
+        file_menu.pack(side="right", padx=(8, 0))
+
+    info = ctk.CTkLabel(win, text="Loading preview…", font=("Segoe UI", 11), text_color=MUTED_TEXT, anchor="w",
+                        justify="left", wraplength=780)
+    info.pack(fill="x", padx=18, pady=(2, 6))
+
+    # --- table ---
+    table_box = ctk.CTkFrame(win, fg_color=CARD_BG, corner_radius=8, border_width=1, border_color=BORDER_COLOR)
+    table_box.pack(fill="both", expand=True, padx=18, pady=(0, 8))
+    table_box.grid_columnconfigure(0, weight=1)
+    table_box.grid_rowconfigure(0, weight=1)
+    tree = ttk.Treeview(table_box, style="Preview.Treeview", show="headings", selectmode="browse")
+    vbar = ctk.CTkScrollbar(table_box, orientation="vertical", command=tree.yview, width=12)
+    hbar = ctk.CTkScrollbar(table_box, orientation="horizontal", command=tree.xview, height=12)
+    tree.configure(yscrollcommand=vbar.set, xscrollcommand=hbar.set)
+    tree.grid(row=0, column=0, sticky="nsew", padx=(px(4), 0), pady=(px(4), 0))
+    vbar.grid(row=0, column=1, sticky="ns", padx=px(2), pady=px(4))
+    hbar.grid(row=1, column=0, sticky="ew", padx=px(4), pady=(0, px(2)))
+    tree.tag_configure("odd", background="#0D1628")
+    tree.tag_configure("even", background=CARD_BG)
+
+    # --- footer ---
+    foot = ctk.CTkFrame(win, fg_color="transparent")
+    foot.pack(fill="x", padx=18, pady=(0, 16))
+    ctk.CTkLabel(foot, text="Read-only. The first row is shown as the column header; “#” is the row number in the file.",
+                 font=("Segoe UI", 10), text_color=MUTED_TEXT, anchor="w").pack(side="left")
+    ctk.CTkButton(foot, text="Close", font=("Segoe UI", 11, "bold"), fg_color=SURFACE_BG, hover_color="#334155",
+                  text_color=WHITE, corner_radius=7, height=30, width=84, command=_close_preview).pack(side="right")
+
+    meas_font = tkfont.Font(root=win, family="Segoe UI", size=-px(11))
+    bold_font = tkfont.Font(root=win, family="Segoe UI", size=-px(11), weight="bold")
+
+    def show(res):
+        tree.delete(*tree.get_children())
+        if res["error"]:
+            tree["columns"] = ()
+            info.configure(text=res["error"], text_color=WARNING_COLOR)
+            sheet_menu.pack_forget()
+            return
+        rows = res["rows"]
+        header, body = rows[0][1], rows[1:]
+        cols = ["rn"] + [f"c{j}" for j in range(len(header))]
+        tree["columns"] = cols
+        tree.heading("rn", text="#", anchor="e")
+        tree.column("rn", width=px(52), minwidth=px(40), stretch=False, anchor="e")
+        for j, h in enumerate(header):
+            title = h or f"({_col_letter(j)})"
+            samples = [title] + [r[1][j] for r in body]
+            wid = max(bold_font.measure(title), max((meas_font.measure(s) for s in samples[1:]), default=0))
+            wid = max(px(56), min(px(280), wid + px(26)))
+            tree.heading(f"c{j}", text=title, anchor="w")
+            tree.column(f"c{j}", width=wid, minwidth=px(40), stretch=False, anchor="w")
+        for i, (rn, cells) in enumerate(body):
+            tree.insert("", "end", values=[rn] + cells, tags=("odd" if i % 2 else "even",))
+        tree.xview_moveto(0)
+        tree.yview_moveto(0)
+        parts = [Path(st["file"]).name]
+        if res["sheet"] and len(res["sheets"]) > 1:
+            parts.append(f"sheet “{res['sheet']}” of {len(res['sheets'])}")
+        if res["total_text"]:
+            parts.append(res["total_text"])
+        cols_text = f"{res['ncols']} columns"
+        if res["shown_cols"] < res["ncols"]:
+            cols_text += f" (first {res['shown_cols']} shown)"
+        parts.append(cols_text)
+        parts.append(f"first {len(body)} rows shown")
+        info.configure(text="  ·  ".join(parts), text_color=SUCCESS_COLOR)
+        if len(res["sheets"]) > 1:
+            sheet_menu.configure(values=res["sheets"])
+            sheet_menu.set(res["sheet"])
+            sheet_menu.pack(side="right", padx=(8, 0))
+        else:
+            sheet_menu.pack_forget()
+
+    def load():
+        token = object()
+        st["token"] = token
+        info.configure(text="Loading preview…", text_color=MUTED_TEXT)
+        box = {}
+
+        def work():
+            try:
+                box["res"] = _read_preview(st["file"], st["sheet"])
+            except Exception as e:
+                box["res"] = {"error": f"The file could not be read for the preview ({e})."}
+
+        threading.Thread(target=work, daemon=True).start()
+
+        def poll():
+            try:
+                if st["token"] is not token or not win.winfo_exists():
+                    return
+                if "res" not in box:
+                    win.after(80, poll)
+                    return
+                show(box["res"])
+            except Exception:
+                pass
+
+        win.after(80, poll)
+
+    def _pick_file(choice):
+        st["file"], st["sheet"] = labels[choice], None
+        load()
+
+    def _pick_sheet(choice):
+        st["sheet"] = choice
+        load()
+
+    win.bind("<Escape>", lambda e: _close_preview())
+    win.protocol("WM_DELETE_WINDOW", _close_preview)
+    _show_dialog_settled(win, 900, 520)
+    load()
+
+
+# ======================================================================
+# Output settings dialog (where cleaned files go and what they are called; saved permanently)
+# ======================================================================
+def _refresh_output_btn():
+    try:
+        if output_is_customised():
+            output_btn.configure(text="● Output settings", text_color=INFO_COLOR)
+        else:
+            output_btn.configure(text="Output settings", text_color=MUTED_TEXT)
+    except Exception:
+        pass
+
+
+def open_output_settings(_event=None):
+    if getattr(app, "_dialog_open", False):
+        return
+    app._dialog_open = True
+    cfg = get_output_settings()
+
+    dialog = ctk.CTkToplevel(app)
+    dialog.withdraw()
+    try:
+        tk.Wm.wm_attributes(dialog, "-alpha", 0.0)
+    except Exception:
+        pass
+    dialog.title("Output settings")
+    dialog.resizable(False, False)
+    dialog.configure(fg_color=NAVY_BLUE)
+    try:
+        dialog.iconbitmap(str(resource_path(os.path.join("assets", "strat_data_cleaner.ico"))))
+    except Exception:
+        pass
+    dialog.transient(app)
+
+    mode_var = tk.StringVar(master=dialog, value=cfg["mode"])
+    folder_var = tk.StringVar(master=dialog, value=cfg["folder"])
+    tmpl_var = tk.StringVar(master=dialog, value=cfg["template"])
+    closed = [False]
+    saved = [False]
+
+    def _close(ok=False):
+        if closed[0]:
+            return
+        closed[0] = True
+        saved[0] = ok
+        dialog.destroy()
+
+    def section(text, top):
+        ctk.CTkLabel(dialog, text=text, font=("Segoe UI", 10, "bold"), text_color=SECTION_TEXT,
+                     anchor="w").pack(fill="x", padx=24, pady=(top, 4))
+
+    ctk.CTkLabel(dialog, text="Output settings", font=("Segoe UI", 14, "bold"), text_color=WHITE,
+                 anchor="w").pack(fill="x", padx=24, pady=(20, 0))
+    ctk.CTkLabel(dialog, text="Saved permanently. They apply to every cleaned file from now on.",
+                 font=("Segoe UI", 11), text_color=MUTED_TEXT, anchor="w").pack(fill="x", padx=24, pady=(0, 2))
+
+    radio_style = {"font": ("Segoe UI", 12), "text_color": LOG_TEXT, "fg_color": ACCENT_ORANGE,
+                   "hover_color": HOVER_ORANGE, "border_color": BORDER_COLOR, "radiobutton_width": 18,
+                   "radiobutton_height": 18}
+
+    section("SAVE LOCATION", 12)
+    ctk.CTkRadioButton(dialog, text="Where each cleaner saves it (default)", variable=mode_var, value="default",
+                       command=lambda: refresh(), **radio_style).pack(anchor="w", padx=24, pady=(0, 6))
+    ctk.CTkRadioButton(dialog, text="A folder I choose", variable=mode_var, value="custom",
+                       command=lambda: refresh(), **radio_style).pack(anchor="w", padx=24, pady=(0, 6))
+
+    folder_row = ctk.CTkFrame(dialog, fg_color="transparent")
+    folder_row.pack(fill="x", padx=24, pady=(0, 2))
+    folder_row.grid_columnconfigure(0, weight=1)
+    entry_style = {"font": ("Segoe UI", 11), "height": 32, "corner_radius": 7, "fg_color": SURFACE_BG,
+                   "border_color": BORDER_COLOR, "border_width": 1, "text_color": WHITE}
+    folder_entry = ctk.CTkEntry(folder_row, textvariable=folder_var, **entry_style)
+    folder_entry.grid(row=0, column=0, sticky="ew")
+
+    def browse():
+        start = folder_var.get().strip()
+        if not os.path.isdir(start):
+            start = CONFIG.get("last_dir") if CONFIG.get("last_dir") and os.path.isdir(CONFIG.get("last_dir")) else str(Path.home())
+        chosen = filedialog.askdirectory(parent=dialog, title="Choose the folder for cleaned files", initialdir=start)
+        if chosen:
+            folder_var.set(os.path.normpath(chosen))
+            mode_var.set("custom")
+            refresh()
+
+    browse_btn = ctk.CTkButton(folder_row, text="Browse…", font=("Segoe UI", 11, "bold"), fg_color=SURFACE_BG,
+                               hover_color="#334155", text_color=WHITE, corner_radius=7, height=32, width=84,
+                               command=browse)
+    browse_btn.grid(row=0, column=1, padx=(8, 0))
+
+    section("FILE NAME", 14)
+    tmpl_entry = ctk.CTkEntry(dialog, textvariable=tmpl_var, **entry_style)
+    tmpl_entry.pack(fill="x", padx=24, pady=(0, 6))
+
+    chips = ctk.CTkFrame(dialog, fg_color="transparent")
+    chips.pack(fill="x", padx=24, pady=(0, 4))
+
+    def insert_token(token):
+        inner = tmpl_entry._entry
+        inner.insert(inner.index("insert"), "{" + token + "}")
+        tmpl_entry.focus_set()
+
+    for token in OUTPUT_TOKENS:
+        ctk.CTkButton(chips, text="{" + token + "}", font=("Consolas", 10, "bold"), fg_color=SURFACE_BG,
+                      hover_color="#334155", text_color=SECTION_TEXT, corner_radius=6, height=24, width=64,
+                      command=lambda t=token: insert_token(t)).pack(side="left", padx=(0, 6))
+
+    ctk.CTkLabel(dialog, text="{name} the cleaner's own file name  ·  {source} the loaded file  ·  {cleaner} the cleaner "
+                              "used  ·  {date} 2026-11-22  ·  {time} 1530",
+                 font=("Segoe UI", 10), text_color=MUTED_TEXT, wraplength=412, justify="left",
+                 anchor="w").pack(fill="x", padx=24, pady=(0, 6))
+
+    example_lbl = ctk.CTkLabel(dialog, text="", font=("Segoe UI", 11), text_color=SUCCESS_COLOR, wraplength=412,
+                               justify="left", anchor="w")
+    example_lbl.pack(fill="x", padx=24, pady=(0, 2))
+    error_lbl = ctk.CTkLabel(dialog, text="", font=("Segoe UI", 11), text_color=ERROR_COLOR, wraplength=412,
+                             justify="left", anchor="w")
+    error_lbl.pack(fill="x", padx=24, pady=(0, 0))
+
+    last_out = getattr(app, "last_output_path", None)
+    sample_name = Path(last_out).stem if last_out else "Cleaned_Data"
+    sample_ext = (Path(last_out).suffix if last_out else "") or ".xlsx"
+    sample_source = Path(app.selected_path).stem if getattr(app, "selected_path", None) else "SourceFile"
+    sample_cleaner = app.current_run[1] if getattr(app, "current_run", None) else "Cadence Cleaner"
+
+    def check():
+        template = tmpl_var.get().strip()
+        if not template:
+            return "The file name can't be empty."
+        bad = unknown_tokens(template)
+        if bad:
+            return ("Unknown " + ("tokens " if len(bad) > 1 else "token ") + ", ".join("{" + b + "}" for b in bad)
+                    + ". Use: " + "  ".join("{" + t + "}" for t in OUTPUT_TOKENS))
+        if mode_var.get() == "custom":
+            folder = folder_var.get().strip()
+            if not folder:
+                return "Choose a folder, or switch back to the default location."
+            if os.path.exists(folder) and not os.path.isdir(folder):
+                return "That path is a file, not a folder."
+        return None
+
+    def refresh(*_):
+        custom = mode_var.get() == "custom"
+        state = "normal" if custom else "disabled"
+        folder_entry.configure(state=state)
+        browse_btn.configure(state=state)
+        err = check()
+        error_lbl.configure(text=err or "")
+        if err and err.startswith("The file name"):
+            example_lbl.configure(text="")
+            return
+        stem = render_output_name(tmpl_var.get().strip(), sample_name, sample_source, sample_cleaner)
+        if sample_ext and stem.lower().endswith(sample_ext.lower()):
+            stem = stem[:-len(sample_ext)].rstrip(". ") or sample_name
+        text = f"Example:  {stem}{sample_ext}"
+        if custom and folder_var.get().strip():
+            text += f"\nin  {folder_var.get().strip()}"
+        example_lbl.configure(text=text)
+
+    tmpl_var.trace_add("write", refresh)
+    folder_var.trace_add("write", refresh)
+
+    def on_save(_e=None):
+        err = check()
+        if err:
+            error_lbl.configure(text=err)
+            return
+        mode = mode_var.get()
+        folder = os.path.normpath(folder_var.get().strip()) if mode == "custom" else ""
+        if mode == "custom":
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as e:
+                error_lbl.configure(text=f"That folder can't be used ({e}).")
+                return
+        CONFIG["output"] = {"mode": mode, "folder": folder, "template": tmpl_var.get().strip()}
+        save_config(CONFIG)
+        _close(True)
+
+    def on_reset():
+        mode_var.set(DEFAULT_OUTPUT["mode"])
+        folder_var.set("")
+        tmpl_var.set(DEFAULT_OUTPUT["template"])
+        refresh()
+
+    btns = ctk.CTkFrame(dialog, fg_color="transparent")
+    btns.pack(side="bottom", fill="x", padx=24, pady=(0, 20))
+    btns.grid_columnconfigure(0, weight=2)
+    btns.grid_columnconfigure((1, 2), weight=1)
+    save_btn = GradientButton(btns, text="Save", font=("Segoe UI", 12, "bold"), fg_color=ACCENT_ORANGE,
+                              hover_color=HOVER_ORANGE, gradient_to=ACCENT_GRADIENT_END, corner_radius=8,
+                              height=38, command=on_save, bg=NAVY_BLUE)
+    save_btn.grid(row=0, column=0, sticky="ew", padx=(0, px(6)))
+    ctk.CTkButton(btns, text="Reset", font=("Segoe UI", 12, "bold"), fg_color=SURFACE_BG, hover_color="#334155",
+                  text_color=WHITE, corner_radius=8, height=38, command=on_reset).grid(row=0, column=1, sticky="ew", padx=6)
+    ctk.CTkButton(btns, text="Cancel", font=("Segoe UI", 12, "bold"), fg_color=SURFACE_BG, hover_color=CANCEL_COLOR,
+                  text_color=WHITE, corner_radius=8, height=38, command=_close).grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+    dialog.bind("<Return>", on_save)
+    dialog.bind("<Escape>", lambda e: _close(False))
+    dialog.protocol("WM_DELETE_WINDOW", _close)
+    refresh()
+
+    _show_dialog_settled(dialog, 460, 540)
+    try:
+        dialog.grab_set()
+    except Exception:
+        pass
+    try:
+        dialog.wait_window()
+    finally:
+        app._dialog_open = False
+    if saved[0]:
+        _refresh_output_btn()
+        new = get_output_settings()
+        where = "default location" if new["mode"] == "default" else new["folder"]
+        log_message(f"Saved output settings: {where}, file name {new['template']}")
+        show_toast("Output settings saved", "success")
+
+
+def _explain_unavailable(c):
+    """Why a cleaner cannot run right now (the 1-6 keys bypass the disabled buttons, so this is checked here too)."""
+    first, second = getattr(app, "selected_path", None), getattr(app, "retail_path", None)
+    label = c["label"]
+    if not first:
+        msg = "Please upload a retail file before running the cleaner."
+    elif c.get("two_file") and not second:
+        msg = (f"The {label} needs two files: one Meta Ads export and one retail sales file. "
+               "Browse again and Ctrl+click both.")
+    elif c.get("two_file"):
+        msg = getattr(app, "pair_msg", None) or "The two files are still being checked. Try again in a moment."
+    else:
+        msg = f"The {label} takes one file, but two are loaded. Browse again and pick a single file."
+    log_message(f"Warning: {msg}")
+    set_banner(msg, WARNING_COLOR)
+
+
 def start_cleaner(c):
     """Confirms (unless turned off) and starts the chosen cleaner."""
     if getattr(app, "is_processing", False) or getattr(app, "_dialog_open", False):
         return
-    if not getattr(app, "selected_path", None):
-        log_message("Warning: Please upload a retail file before running the cleaner.")
+    if not _cleaner_available(c):
+        _explain_unavailable(c)
         return
+    extra = app.retail_path if c.get("two_file") else None
     name = Path(app.selected_path).name
+    if extra:
+        name = f"{name}” + “{Path(extra).name}"
     force = False
-    if already_cleaned(app.selected_path, c["label"]):
+    if already_cleaned(app.selected_path, c["label"], extra):
         if not custom_askyesno("Already cleaned",
                                f"“{name}” was already cleaned with the {c['label']} this session. "
                                "Run it again anyway? A new output file is created; nothing is overwritten.",
@@ -2200,7 +3308,8 @@ def start_cleaner(c):
         if not custom_askyesno("Confirm Action", f"Run the {c['label']} on “{name}”?"):
             log_message(f"{c['label']} cancelled before starting.")
             return
-    run_cleaner_process((c["module"], c["func"]), c["btn"], c["label"], c["color"], c["hover"], force=force)
+    run_cleaner_process((c["module"], c["func"]), c["btn"], c["label"], c["color"], c["hover"], force=force,
+                        extra_path=extra)
 
 
 # ======================================================================
@@ -2281,7 +3390,7 @@ class LoadingSplash(tk.Toplevel):
 # ======================================================================
 # Main App Initialization
 # ======================================================================
-FILE_PLACEHOLDER = "Click here to choose an Excel or CSV file  (Ctrl+O)"
+FILE_PLACEHOLDER = "Click here to choose an Excel or CSV file  (Ctrl+O)\nMeta Ads? Ctrl+click two files: Meta Ads + retail"
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
@@ -2334,7 +3443,13 @@ if __name__ == "__main__":
 
     app.is_processing = False
     app.cancel_requested = False
-    app.selected_path = None
+    app.selected_path = None   # the only file, or the Meta Ads file when two are loaded
+    app.retail_path = None     # second file (retail sales) of a Meta Ads pair
+    app.pair_ok = False        # True once the two files are recognised as Meta Ads + retail
+    app.pair_msg = None        # what is wrong with the pair, when it is not usable
+    app.file_tag = None
+    app.file_warn = False
+    app.current_extra = None
     app.last_output_path = None
     app.run_done = False
     app.skip_confirm = False
@@ -2380,6 +3495,9 @@ if __name__ == "__main__":
     # Step 1 - select file
     step1_row, step1_badge, step1_title, _ = make_step_row(left_col, 1, "SELECT RETAIL FILE")
     step1_row.pack(fill="x", pady=(0, 6))
+    preview_btn = ctk.CTkButton(step1_row, text="Preview file", font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG,
+                                hover_color="#334155", text_color=WHITE, corner_radius=6, height=22, width=92,
+                                command=open_preview)   # shown (step 1 row, right) once a file is loaded
 
     upload_card = ctk.CTkFrame(left_col, fg_color=CARD_BG, corner_radius=12, border_width=1, border_color=BORDER_COLOR)
     upload_card.pack(fill="x", pady=(0, 12))
@@ -2485,7 +3603,7 @@ if __name__ == "__main__":
         {"btn": current_sales_btn, "label": "Current/Daily Sales Cleaner", "color": CURRENT_SALES_COLOR, "hover": CURRENT_SALES_HOVER,
          "accent": CURRENT_SALES_ACCENT, "module": "current_sales_cleaner", "func": "process_current_sales", "desc": "Current/daily sales export with all-caps store names (e.g. ALTITUDE ALABANG TOWN CENTER). Same cleaning as the Database Cleaner."},
         {"btn": meta_ads_btn, "label": "Meta Ads Cleaner", "color": META_ADS_COLOR, "hover": META_ADS_HOVER,
-         "accent": META_ADS_ACCENT, "module": "meta_ads_cleaner", "func": "process_meta_ads", "desc": "Meta Ads (Supermetrics) export. Keeps messaging campaigns of recognized stores, standardizes store and brand names, and consolidates cost and messaging conversations per store and brand (Summary + Daily). Removed rows go to the Removal Audit Log."},
+         "accent": META_ADS_ACCENT, "module": "meta_ads_cleaner", "func": "process_meta_ads", "two_file": True, "desc": "Needs TWO files: Ctrl+click the Meta Ads (Supermetrics) export and a retail sales file in the browse window. Output: Meta Cleaned Data, Retail Data (with distinct online transactions), Reconciliation and Audit sheets."},
     ]
     for _c in CLEANERS:
         _c["btn"].configure(command=lambda c=_c: start_cleaner(c))
@@ -2539,6 +3657,18 @@ if __name__ == "__main__":
     # Step 3 - review results
     step3_row, step3_badge, step3_title, _ = make_step_row(left_col, 3, "REVIEW RESULTS")
     step3_row.pack(fill="x", pady=(0, 6))
+    step3_tools = ctk.CTkFrame(step3_row, fg_color="transparent")
+    step3_tools.grid(row=0, column=2, sticky="e")
+    preview_result_btn = ctk.CTkButton(step3_tools, text="Preview result", font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG,
+                                       hover_color="#334155", text_color=WHITE, text_color_disabled=DISABLED_TEXT,
+                                       corner_radius=6, height=22, width=100, state="disabled",
+                                       command=open_result_preview)   # enabled after the first successful run
+    preview_result_btn.pack(side="left", padx=(0, 6))
+    output_btn = ctk.CTkButton(step3_tools, text="Output settings", font=("Segoe UI", 10, "bold"), fg_color=SURFACE_BG,
+                               hover_color="#334155", text_color=MUTED_TEXT, corner_radius=6, height=22, width=112,
+                               command=open_output_settings)
+    output_btn.pack(side="left")
+    _refresh_output_btn()
     step_widgets = [(step1_badge, step1_title, 1), (step2_badge, step2_title, 2), (step3_badge, step3_title, 3)]
 
     output_frame = ctk.CTkFrame(left_col, fg_color="transparent")
@@ -2632,6 +3762,18 @@ if __name__ == "__main__":
     log_filter.set("All")
     log_filter.pack(side="left")
 
+    log_search = ctk.CTkEntry(log_tools, placeholder_text="Search log…  (Ctrl+F)", height=24, width=90, corner_radius=6,
+                              font=("Segoe UI", 10), fg_color=SURFACE_BG, border_color=BORDER_COLOR, border_width=1,
+                              text_color=WHITE, placeholder_text_color=MUTED_TEXT)
+    log_search.pack(side="left", fill="x", expand=True, padx=(8, 0))
+    log_search_count = ctk.CTkLabel(log_tools, text="", width=52, font=("Segoe UI", 10, "bold"), text_color=MUTED_TEXT)
+    log_search_count.pack(side="left", padx=(4, 0))
+    _log_search["entry"], _log_search["count"] = log_search, log_search_count
+    log_search.bind("<KeyRelease>", _on_log_search_key, add="+")
+    log_search.bind("<Return>", _log_search_step(1), add="+")
+    log_search.bind("<Shift-Return>", _log_search_step(-1), add="+")
+    log_search.bind("<Escape>", clear_log_search, add="+")
+
     status_box = ctk.CTkTextbox(log_col, height=LOG_MIN_HEIGHT, corner_radius=9, fg_color=LOG_BG, text_color=LOG_TEXT,
                                 font=("Consolas", 11), border_width=1, border_color=BORDER_COLOR, wrap="word")
     status_box.grid(row=1, column=0, sticky="nsew")
@@ -2645,6 +3787,10 @@ if __name__ == "__main__":
     status_box._textbox.tag_config("fresh", background=LOG_BG)  # the newest line fades out of a soft highlight
     status_box._textbox.tag_config("stamp", foreground=LOG_STAMP)  # muted [time] prefix (created after the level tags so it wins)
     status_box._textbox.tag_config("flash", background="#3B2F0B")  # brief highlight when jumping to a warning
+    status_box._textbox.tag_config("searchhit", background=LOG_HIT_BG)     # every search match
+    status_box._textbox.tag_config("searchcur", background=LOG_CUR_BG, foreground=NAVY_BLUE)   # the current match
+    status_box._textbox.tag_raise("searchhit")
+    status_box._textbox.tag_raise("searchcur")
 
     status_box.insert("end", "[System] Application ready. Browse a retail file to begin.\n", "normal")
     status_box.configure(state="disabled")
@@ -2883,9 +4029,18 @@ if __name__ == "__main__":
     app.bind("<Control-l>", clear_log)
     app.bind("<Control-L>", clear_log)
     app.bind("<Escape>", request_cancel)
+    app.bind("<Control-f>", focus_log_search)
+    app.bind("<Control-F>", focus_log_search)
+    app.bind("<Control-p>", open_preview)
+    app.bind("<Control-P>", open_preview)
 
     def _cleaner_shortcut(index):
         def handler(_event=None):
+            try:
+                if _event is not None and _event.widget.winfo_class() == "Entry":
+                    return          # typing a digit in the log search box is not a shortcut
+            except Exception:
+                pass
             if getattr(app, "is_processing", False):
                 return
             if not getattr(app, "selected_path", None):
